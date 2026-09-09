@@ -20,7 +20,7 @@ disk_totals = []
 usuario = None
 
 
-with open('20082026/dados.csv', mode='r', encoding='utf-8') as file:
+with open('./dados.csv', mode='r', encoding='utf-8') as file:
     reader = csv.DictReader(file)
     
     for row in reader:

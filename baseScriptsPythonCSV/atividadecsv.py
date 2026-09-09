@@ -2,11 +2,11 @@ import csv
 import psutil
 import datetime
 
-usuario = "gus"
+usuario = "Nicole"
     
 def criar_csv():
     with open('./dados.csv', 'w') as csvfile:
-        csv.writer(csvfile,delimiter=',').writerow(['usuario', 'Date', 'CPU (percent)', 'CPU (frequency)','RAM (percent)', 'Disk (percent)', 'Disk (total)', 'Disk (free)', 'Disk (read)', 'Disk (write)'])
+        csv.writer(csvfile).writerow(['usuario', 'Date', 'CPU (percent)', 'CPU (frequency)','RAM (percent)', 'Disk (percent)', 'Disk (total)', 'Disk (free)', 'Disk (read)', 'Disk (write)'])
     getStats()
 
 def getStats():
