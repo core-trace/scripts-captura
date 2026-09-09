@@ -29,7 +29,7 @@ public class Main {
             String timestamp = LocalDateTime.now().format(dtf);
 
             // Simulação de dados
-            double cpu = 60.0 + (random.nextDouble() * 75.0); 
+            double cpu = 60.0 + (random.nextDouble() * 75.0);
             double ram = 30.0 + (random.nextDouble() * 40.0);
             double disco = 45.2;
 
