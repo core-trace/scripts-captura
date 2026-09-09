@@ -6,7 +6,7 @@ usuario = "user"
     
 def criar_csv():
     with open('dados.csv', 'w', newline='') as csvfile:
-        csv.writer(csvfile).writerow(['usuario', 'Date', 'CPU (percent)', 'CPU (frequency)','RAM (percent)', 'Disk (percent)', 'Disk (total)', 'Disk (free)', 'Disk (read)', 'Disk (write)'])
+        csv.writer(csvfile).writerow(['usuario', 'Date', 'CPU (percent)', 'CPU (frequency)', 'CPU (threads)', 'RAM (percent)', 'RAM (used)', 'RAM (total)', 'Disk (percent)', 'Disk (total)', 'Disk (free)', 'Disk (read)', 'Disk (write)'])
     getStats()
 
 def getStats():
@@ -16,6 +16,8 @@ def getStats():
             cpu_percent = psutil.cpu_percent(interval=0.5)
             
             cpu_frequency = psutil.cpu_freq().current
+            
+            cpu_threads = psutil.cpu_count()
             
             agora = datetime.datetime.now()
             
@@ -28,7 +30,7 @@ def getStats():
             disk_rw = psutil.disk_io_counters()
             
             with open('dados.csv', 'a') as csvfile:
-                csv.writer(csvfile).writerow([usuario, timestamp, cpu_percent, cpu_frequency, ram.percent, disk_usage.percent, disk_usage.total, disk_usage.free, disk_rw.read_bytes, disk_rw.write_bytes])
+                csv.writer(csvfile).writerow([usuario, timestamp, cpu_percent, cpu_frequency, cpu_threads, ram.percent, ram.used, ram.total, disk_usage.percent, disk_usage.total, disk_usage.free, disk_rw.read_bytes, disk_rw.write_bytes])
 
         except Exception as e:
             print(f"Erro ao coletar dados: {e}")
