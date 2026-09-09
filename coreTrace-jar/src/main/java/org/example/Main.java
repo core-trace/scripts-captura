@@ -28,7 +28,7 @@ public class Main {
             simulacoes++;
             String timestamp = LocalDateTime.now().format(dtf);
 
-            // Simulação de dados
+
             double cpu = 60.0 + (random.nextDouble() * 75.0);
             double ram = 30.0 + (random.nextDouble() * 40.0);
             double disco = 45.2;
@@ -38,7 +38,7 @@ public class Main {
             System.out.printf("[%s] [INFO] [RAM] Uso da Memória: %.2f%%\n", timestamp, ram);
             System.out.printf("[%s] [INFO] [DISCO] Uso do Disco: %.2f%%\n", timestamp, disco);
 
-            // Simulação de Alerta se CPU passar de 80%
+            // Simulação de Alerta 
             if (cpu > 80.0) {
                 System.out.println("[" + timestamp + "] [WARN] [ThresholdAlert] ATENÇÃO: Uso crítico de CPU (" + String.format("%.2f", cpu) + "%)!");
                 System.out.println("[" + timestamp + "] [INFO] [SlackIntegration] Disparando notificação para o canal #alerta-infra-ifood...");
