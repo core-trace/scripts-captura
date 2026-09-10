@@ -3,9 +3,16 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Random;
 
+import java.io.FileOutputStream;
+import java.io.PrintStream;
+import java.io.FileNotFoundException;
+
 public class Main {
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws InterruptedException, FileNotFoundException {
+        PrintStream logFile = new PrintStream(new FileOutputStream("app.log", true));
+        System.setOut(logFile);
+
         DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
         Random random = new Random();
 
@@ -29,8 +36,8 @@ public class Main {
             String timestamp = LocalDateTime.now().format(dtf);
 
 
-            double cpu = 60.0 + (random.nextDouble() * 75.0);
-            double ram = 30.0 + (random.nextDouble() * 40.0);
+            double cpu = 60.0 + (random.nextDouble() * 25.0);
+            double ram = 30.0 + (random.nextDouble() * 35.0);
             double disco = 45.2;
 
             System.out.println("[" + timestamp + "] [INFO] [MetricCollector] --- Captura #" + simulacoes + " ---");
@@ -44,6 +51,13 @@ public class Main {
                 System.out.println("[" + timestamp + "] [INFO] [SlackIntegration] Disparando notificação para o canal #alerta-infra-ifood...");
                 System.out.println("[" + timestamp + "] [INFO] [JiraIntegration] Simulando criação de ticket no Jira...");
             }
+
+            if (ram > 70) {
+                System.out.println("[" + timestamp + "] [WARN] [ThresholdAlert] ATENÇÃO: Uso crítico de Memória RAM (" + String.format("%.2f", ram) + "%)!");
+                System.out.println("[" + timestamp + "] [INFO] [SlackIntegration] Disparando notificação para o canal #alerta-infra-ifood...");
+                System.out.println("[" + timestamp + "] [INFO] [JiraIntegration] Simulando criação de ticket no Jira...");
+            }
+
 
             System.out.println("[" + timestamp + "] [INFO] [Database] [LOCAL] Métricas gravadas temporariamente na base local.\n");
 
