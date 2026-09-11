@@ -1,17 +1,21 @@
 package org.example;
+
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.PrintStream;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Random;
 
-import java.io.FileOutputStream;
-import java.io.PrintStream;
-import java.io.FileNotFoundException;
-
 public class Main {
 
     public static void main(String[] args) throws InterruptedException, FileNotFoundException {
-        PrintStream logFile = new PrintStream(new FileOutputStream("app.log", true));
+        // Caminho absoluto para a EC2 + auto-flush ativado (segundo argumento 'true')
+        PrintStream logFile = new PrintStream(new FileOutputStream("/home/ubuntu/app.log", true), true);
+
+        // Redireciona tanto o System.out quanto o System.err para o log
         System.setOut(logFile);
+        System.setErr(logFile);
 
         DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
         Random random = new Random();
@@ -35,7 +39,6 @@ public class Main {
             simulacoes++;
             String timestamp = LocalDateTime.now().format(dtf);
 
-
             double cpu = 60.0 + (random.nextDouble() * 25.0);
             double ram = 30.0 + (random.nextDouble() * 35.0);
             double disco = 45.2;
@@ -45,7 +48,7 @@ public class Main {
             System.out.printf("[%s] [INFO] [RAM] Uso da Memória: %.2f%%\n", timestamp, ram);
             System.out.printf("[%s] [INFO] [DISCO] Uso do Disco: %.2f%%\n", timestamp, disco);
 
-            // Simulação de Alerta 
+            // Simulação de Alerta
             if (cpu > 80.0) {
                 System.out.println("[" + timestamp + "] [WARN] [ThresholdAlert] ATENÇÃO: Uso crítico de CPU (" + String.format("%.2f", cpu) + "%)!");
                 System.out.println("[" + timestamp + "] [INFO] [SlackIntegration] Disparando notificação para o canal #alerta-infra-ifood...");
@@ -58,11 +61,12 @@ public class Main {
                 System.out.println("[" + timestamp + "] [INFO] [JiraIntegration] Simulando criação de ticket no Jira...");
             }
 
-
             System.out.println("[" + timestamp + "] [INFO] [Database] [LOCAL] Métricas gravadas temporariamente na base local.\n");
 
             Thread.sleep(3000);
         }
 
+        // Libera o recurso ao finalizar
+        logFile.close();
     }
 }
