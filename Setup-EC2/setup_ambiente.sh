@@ -272,6 +272,34 @@ echo ""
 echo "MySQL:"
 mysql --version
 
+# ============================================================
+
+# MYSQL NO DOCKER
+
+# ============================================================
+
+echo "Configurando MySQL no Docker..."
+
+# Criar volume persistente
+
+if ! docker volume inspect coretrace_mysql_data >/dev/null 2>&1; then
+    docker volume create coretrace_mysql_data
+fi
+
+# Criar container somente se ele ainda não existir
+
+if ! docker container inspect coretrace_mysql >/dev/null 2>&1; then
+
+    docker run -d \
+        --name coretrace_mysql \
+        -e MYSQL_ROOT_PASSWORD=coretrace123 \
+        -e MYSQL_DATABASE=CoreTrace \
+        -p 127.0.0.1:3307:3306 \
+        -v coretrace_mysql_data:/var/lib/mysql \
+        --restart unless-stopped \
+        mysql:8.0
+
+fi
 echo ""
 echo "=========================================="
 echo "       CONFIGURAÇÃO CONCLUÍDA"
@@ -286,4 +314,5 @@ echo "- Python"
 echo "- Java 21"
 echo "- Docker"
 echo "- MySQL"
+echo "- MySQL no Docker"
 echo ""
