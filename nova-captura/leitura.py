@@ -23,7 +23,7 @@ def ler_csv(nome_arquivo: str) -> list:
     return dados
 
 def main():
-    dados = ler_csv(f'nautilus_coleta_{NOME_MAQUINA}.csv')
+    dados = ler_csv(f'coretrace_coleta_{NOME_MAQUINA}.csv')
 
     if len(dados) == 0:
         print("Nenhum dado encontrado.")

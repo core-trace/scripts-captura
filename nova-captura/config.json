@@ -1,3 +1,4 @@
 {
-    "token_servidor": "123"
+    "token_instalacao": "123",
+    "token_perfil_servidor": "321"
 }
