@@ -5,14 +5,13 @@ import os
 import json
 import requests
 from datetime import datetime
+from rede.rede import coletar_rede, COLUNAS_REDE
+from processos.processos import coletar_processos, COLUNAS_PROCESSOS
 
 
-# Configurar as variáveis de ambiente pra API pra cahamar commais facilidade posteriormente
 API_BASE_URL = "http://localhost:3333"
 API_FILTRO_URL = "http://localhost:3334"
 
-
-# Token de instalação e token do perfil do servidor ficam salvos no arquivo de configuração
 ARQUIVO_CONFIG = "config.json"
 
 
@@ -21,8 +20,6 @@ def obter_endereco_mac():
 
     for nome_interface, enderecos in interfaces.items():
         for endereco in enderecos:
-
-            # family é o tipo de endereço, p.AF_LINK é o tipo de endereço MAC
             if endereco.family == p.AF_LINK:
                 if endereco.address and endereco.address != "00:00:00:00:00:00":
                     return endereco.address.upper()
@@ -30,7 +27,6 @@ def obter_endereco_mac():
     return None
 
 
-# Função para carregar o arquivo de configuração
 def carregar_config():
     if not os.path.exists(ARQUIVO_CONFIG):
         print(f"Arquivo de configuração '{ARQUIVO_CONFIG}' não encontrado.")
@@ -45,7 +41,6 @@ def carregar_config():
         exit()
 
 
-# Função para verificar se o node já está registrado
 def ativar_agente(
     token_instalacao,
     token_perfil_servidor,
@@ -81,7 +76,6 @@ def buscar_metricas_cliente(
     token_instalacao,
     token_perfil_servidor
 ):
-    # Usa a nossa API pra pegar os "comando_parametro" que foram cadastrados pro perfil do servidor
     try:
         resposta = requests.get(
             f"{API_FILTRO_URL}/empresa/metricas",
@@ -94,7 +88,6 @@ def buscar_metricas_cliente(
         if resposta.status_code == 200:
             metricas = resposta.json()
 
-            # Seleciona as métricas que vieram do model da empresa
             print(f"{len(metricas)} métricas carregadas.\n")
 
             return metricas
@@ -113,18 +106,13 @@ def buscar_metricas_cliente(
         return []
 
 
-# Converte os valores da coluna "argumento_valor" do banco para o que o psutil necessita
 def converter_valor(valor):
-
-    # Se não veio argumento, não converte
     if valor is None:
         return None
 
-    # Verifica o tipo
     if not isinstance(valor, str):
         return valor
 
-    # Remove espaços do início e do fim
     valor = valor.strip()
 
     if valor.lower() == "true":
@@ -136,33 +124,21 @@ def converter_valor(valor):
     if valor.lower() == "none":
         return None
 
-    # Tenta converter para inteiro
     try:
         return int(valor)
 
     except ValueError:
         pass
 
-    # Tenta convereter para float
     try:
         return float(valor)
 
     except ValueError:
         pass
 
-    # Caso nenhuma conversão funcione, retorna como texto
     return valor
 
 
-# {
-#    "funcao_psutil": "cpu_count",
-#    "argumento_nome": "logical",
-#    "argumento_valor": "true"
-# }
-# Precisa virar -> p.cpu_count(logical=True)
-#
-
-# Monta os parâmetros que são enviados para a função do psutil
 def montar_argumentos(metrica):
     nome = metrica.get("argumento_nome")
 
@@ -170,7 +146,6 @@ def montar_argumentos(metrica):
         metrica.get("argumento_valor")
     )
 
-    # Retorna um dicionário montado com o nome e o valor do argumento
     if nome is None:
         return {}
 
@@ -179,37 +154,22 @@ def montar_argumentos(metrica):
     }
 
 
-# Executa a função do psutil de forma dinâmica a partir da montagem dos argumentos
 def executar_funcao(metrica, cache):
     nome_funcao = metrica["funcao_psutil"]
 
     argumentos = montar_argumentos(metrica)
 
-    # Monta uma tupla que armazena a funcao e os argumentos para poder diferenciar a mesma função com argumentos diferentes
-    # Exemplo: p.cpu_count(logical=True) e p.cpu_count(logical=False) são chamadas diferentes da mesma função
     chave_cache = (
         nome_funcao,
-
-        # Ordena de forma crescente os valores da lista de argumentos e coloca em uma tupla para poder ser usada como chave do dicionário
         tuple(sorted(argumentos.items()))
     )
 
-    # Caso a função ainda não tenha sido chamada, ele executa
     if chave_cache not in cache:
-
-        # Executa a função de forma conceitual, onde o getattr acesso o atributo de um objeto usando o nome dele em forma de texto
-        # nome_funcao = "cpu_percent"
-        # funcao = p.cpu_percent
         funcao = getattr(
             p,
             nome_funcao
         )
 
-        # **argumentos é equivalente a
-        # argumentos = {
-        #     "logical": True
-        # }
-        # assim funcao(**argumentos) é equivalente a funcao(logical=True)
         cache[chave_cache] = funcao(
             **argumentos
         )
@@ -217,34 +177,6 @@ def executar_funcao(metrica, cache):
     return cache[chave_cache]
 
 
-# O retorno seria parecido com isso
-# cache = {
-#     ("virtual_memory", ()):
-#         svmem(
-#             total=16777216000,
-#             available=8245000000,
-#             percent=50.8,
-#             used=7450000000,
-#             free=2100000000
-#         ),
-#
-#     (
-#         "cpu_count",
-#         (
-#             ("logical", True),
-#         )
-#     ): 16,
-#
-#     (
-#         "cpu_count",
-#         (
-#             ("logical", False),
-#         )
-#     ): 8
-# }
-
-
-# Verifica qual campo deve ser retornado da função do psutil
 def extrair_retorno(
     resultado,
     metrica
@@ -257,14 +189,12 @@ def extrair_retorno(
         "indice_retorno"
     )
 
-    # Equivalente a resultado = resultado.atributo, porque algumas funções do psutil retornam objetos com atributos
     if atributo is not None:
         resultado = getattr(
             resultado,
             atributo
         )
 
-    # Equivalente a resultado = resultado[indice], porque algumas funções do psutil retornam listas ou tuplas
     if indice is not None:
         resultado = resultado[indice]
 
@@ -276,14 +206,11 @@ def capturar_metrica(
     cache
 ):
     try:
-
-        # Executa a função do psutil
         resultado = executar_funcao(
             metrica,
             cache
         )
 
-        # Pega o valor específico desejado
         resultado = extrair_retorno(
             resultado,
             metrica
@@ -311,7 +238,6 @@ def capturar_dados(
     metricas,
     endereco_mac
 ):
-    # Criar um cache para armazenar os resultados a cada rodada e evitar chamadas repetidas
     cache = {}
 
     dados = {
@@ -399,18 +325,17 @@ if not metricas:
     exit()
 
 
-# Colunas padrão
 colunas = [
     "TIMESTAMP",
     "ENDERECO_MAC"
 ]
 
-
-# Colunas das métricas do banco
 colunas.extend(
     metrica["nome_coluna"]
     for metrica in metricas
 )
+
+colunas.extend(COLUNAS_REDE)
 
 
 mac_arquivo = endereco_mac.replace(
@@ -419,9 +344,8 @@ mac_arquivo = endereco_mac.replace(
 )
 
 caminho_arquivo = (
-    f"./coretrace_coleta_{mac_arquivo}.csv"
+    f"./metricas_gerais_{mac_arquivo}.csv"
 )
-
 
 arquivo_existe = os.path.exists(
     caminho_arquivo
@@ -434,15 +358,35 @@ arquivo = open(
     encoding="utf-8"
 )
 
-
 escritor = csv.DictWriter(
     arquivo,
     fieldnames=colunas
 )
 
-
 if not arquivo_existe:
     escritor.writeheader()
+
+
+caminho_processos = f"./processos_{mac_arquivo}.csv"
+
+processos_existe = os.path.exists(
+    caminho_processos
+)
+
+arquivo_processos = open(
+    caminho_processos,
+    "a",
+    newline="",
+    encoding="utf-8"
+)
+
+escritor_processos = csv.DictWriter(
+    arquivo_processos,
+    fieldnames=COLUNAS_PROCESSOS
+)
+
+if not processos_existe:
+    escritor_processos.writeheader()
 
 
 try:
@@ -452,11 +396,24 @@ try:
             endereco_mac
         )
 
+        dados.update(
+            coletar_rede()
+        )
+
         escritor.writerow(
             dados
         )
 
         arquivo.flush()
+
+        escritor_processos.writerows(
+            coletar_processos(
+                dados["TIMESTAMP"],
+                endereco_mac
+            )
+        )
+
+        arquivo_processos.flush()
 
         print(
             f"{dados['TIMESTAMP']} - "
@@ -474,3 +431,4 @@ except KeyboardInterrupt:
 
 finally:
     arquivo.close()
+    arquivo_processos.close()
