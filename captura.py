@@ -344,7 +344,7 @@ mac_arquivo = endereco_mac.replace(
 )
 
 caminho_arquivo = (
-    f"./metricas_gerais_{mac_arquivo}.csv"
+    f"./coretrace_coleta_{mac_arquivo}.csv"
 )
 
 arquivo_existe = os.path.exists(
