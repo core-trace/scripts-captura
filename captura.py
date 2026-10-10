@@ -4,6 +4,8 @@ import time
 import os
 import json
 import requests
+import boto3
+import io
 from datetime import datetime
 from rede.rede import coletar_rede, COLUNAS_REDE
 from processos.processos import coletar_processos, COLUNAS_PROCESSOS
@@ -14,6 +16,28 @@ API_FILTRO_URL = "http://localhost:3334"
 
 ARQUIVO_CONFIG = "config.json"
 
+BUCKET = "bucket-coretrace"
+PASTA_S3 = "raw"
+
+s3 = boto3.client("s3")
+
+def enviar_s3(conteudo, nome_arquivo):
+    chave_s3 = f"{PASTA_S3}/{nome_arquivo}"
+
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=chave_s3,
+            Body=conteudo.encode("utf-8"),
+            ContentType="text/csv; charset=utf-8"
+        )
+
+        print(f"Arquivo enviado para s3://{BUCKET}/{chave_s3}")
+        return True
+
+    except Exception as erro:
+        print(f"Erro ao enviar {nome_arquivo}: {erro}")
+        return False
 
 def obter_endereco_mac():
     interfaces = p.net_if_addrs()
@@ -338,73 +362,33 @@ colunas.extend(
 colunas.extend(COLUNAS_REDE)
 
 
-mac_arquivo = endereco_mac.replace(
-    ":",
-    "-"
-)
 
-caminho_arquivo = (
-    f"./coretrace_coleta_{mac_arquivo}.csv"
-)
+mac_arquivo = endereco_mac.replace(":", "-")
+timestamp_arquivo = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-arquivo_existe = os.path.exists(
-    caminho_arquivo
-)
+nome_arquivo = f"coretrace_coleta_{mac_arquivo}_{timestamp_arquivo}.csv"
+nome_processos = f"processos_{mac_arquivo}_{timestamp_arquivo}.csv"
 
-arquivo = open(
-    caminho_arquivo,
-    "a",
-    newline="",
-    encoding="utf-8"
-)
+# CSVs mantidos apenas na memória
+buffer = io.StringIO()
+escritor = csv.DictWriter(buffer, fieldnames=colunas)
+escritor.writeheader()
 
-escritor = csv.DictWriter(
-    arquivo,
-    fieldnames=colunas
-)
-
-if not arquivo_existe:
-    escritor.writeheader()
-
-
-caminho_processos = f"./processos_{mac_arquivo}.csv"
-
-processos_existe = os.path.exists(
-    caminho_processos
-)
-
-arquivo_processos = open(
-    caminho_processos,
-    "a",
-    newline="",
-    encoding="utf-8"
-)
-
+buffer_processos = io.StringIO()
 escritor_processos = csv.DictWriter(
-    arquivo_processos,
+    buffer_processos,
     fieldnames=COLUNAS_PROCESSOS
 )
+escritor_processos.writeheader()
 
-if not processos_existe:
-    escritor_processos.writeheader()
-
+ultimo_envio = time.monotonic()
 
 try:
     while True:
-        dados = capturar_dados(
-            metricas,
-            endereco_mac
-        )
+        dados = capturar_dados(metricas, endereco_mac)
+        dados.update(coletar_rede())
 
-        dados.update(
-            coletar_rede()
-        )
-
-        escritor.writerow(
-            dados
-        )
-
-        arquivo.flush()
+        escritor.writerow(dados)
 
         escritor_processos.writerows(
             coletar_processos(
@@ -413,22 +397,60 @@ try:
             )
         )
 
-        arquivo_processos.flush()
-
         print(
             f"{dados['TIMESTAMP']} - "
-            f"Captura salva para o MAC "
-            f"{endereco_mac}: "
-            f"{dados}"
+            f"Captura realizada para o MAC {endereco_mac}"
         )
 
-        time.sleep(1)
+        if time.monotonic() - ultimo_envio >= 60:
+            envio_coleta = enviar_s3(
+                buffer.getvalue(),
+                nome_arquivo
+            )
 
+            envio_processos = enviar_s3(
+                buffer_processos.getvalue(),
+                nome_processos
+            )
+
+            if envio_coleta and envio_processos:
+                # Limpa os buffers e prepara novos CSVs
+                buffer.seek(0)
+                buffer.truncate(0)
+                escritor.writeheader()
+
+                buffer_processos.seek(0)
+                buffer_processos.truncate(0)
+                escritor_processos.writeheader()
+
+                # Gera novos nomes para o próximo intervalo
+                timestamp_arquivo = datetime.now().strftime(
+                    "%Y-%m-%d_%H-%M-%S"
+                )
+
+                nome_arquivo = (
+                    f"coretrace_coleta_{mac_arquivo}_{timestamp_arquivo}.csv"
+                )
+
+                nome_processos = (
+                    f"processos_{mac_arquivo}_{timestamp_arquivo}.csv"
+                )
+
+                ultimo_envio = time.monotonic()
+
+            else:
+                print("Envio incompleto. Os dados foram mantidos na memória.")
+                ultimo_envio = time.monotonic()
+
+        time.sleep(1)
 
 except KeyboardInterrupt:
     print("\nMonitoramento encerrado.")
 
-
 finally:
-    arquivo.close()
-    arquivo_processos.close()
+    # Envia os dados restantes ao encerrar o programa
+    if buffer.tell() > 0:
+        enviar_s3(buffer.getvalue(), nome_arquivo)
+
+    if buffer_processos.tell() > 0:
+        enviar_s3(buffer_processos.getvalue(), nome_processos)
