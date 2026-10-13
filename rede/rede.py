@@ -27,7 +27,8 @@ def coletar_rede():
     agora = time.time()
     io = psutil.net_io_counters()
 
-    dados = {coluna: None for coluna in COLUNAS_REDE}
+    # A primeira rodada tem campos vazios; as próximas incluem números.
+    dados: dict[str, int | float | None] = {coluna: None for coluna in COLUNAS_REDE}
     dados["REDE_ERROS"] = io.errin + io.errout
     dados["REDE_CONEXOES_ESTABELECIDAS"] = contar_conexoes_estabelecidas()
 
