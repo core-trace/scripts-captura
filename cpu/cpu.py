@@ -1,187 +1,225 @@
 import utils.exibicao as ex
-import utils.funcoes_gerais as fg
 from datetime import datetime
+import math
+
+def ler_valor_cpu(registro, campo):
+    # Lê o campo do CSV. 
+    # Se a métrica não foi coletada retorna None
+    valor = registro.get(campo)
+
+    # Se campo for vazio ou leitura for inválida não deve entrar na média
+    if valor is None or valor == "":
+        return None
+
+    status = registro.get(campo + "_status")
+    if status is not None and status != "ok":
+        return None
+
+    # Tenta transformar o valor em número
+    try:
+        numero = float(valor)
+
+    except (ValueError, TypeError):
+        return None
+
+    # Se for infinito ou Nan retorna none
+    if not math.isfinite(numero):
+        return None
+    return numero
+
+
+def media_cpu(lista, campo, minutos=None):
+    # Soma só as leituras válidas
+    # Zero também é uma leitura válida
+    if len(lista) == 0:
+        return None
+
+    ultima_data = None
+    if minutos is not None:
+        ultima_data = datetime.strptime(lista[-1]["TIMESTAMP"], "%Y-%m-%d %H:%M:%S")
+
+    soma = 0
+    quantidade = 0
+
+    for registro in lista:
+        if minutos is not None and ultima_data is not None:
+            data = datetime.strptime(registro["TIMESTAMP"], "%Y-%m-%d %H:%M:%S")
+            segundos = (ultima_data - data).total_seconds()
+            if segundos < 0 or segundos > minutos * 60:
+                continue
+
+        valor = ler_valor_cpu(registro, campo)
+        if valor is not None:
+            soma += valor
+            quantidade += 1
+
+    if quantidade == 0:
+        return None
+    return soma / quantidade
+
 
 def media_cpu_geral(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "CPU_PERCENT"
+        "cpu_percent"
     )
 
 
 def media_cpu_30_min(lista: list):
-    return fg.media_interv_min(
+    return media_cpu(
         lista,
-        30,
-        "CPU_PERCENT"
+        "cpu_percent",
+        minutos=30
     )
 
 
 def media_cpu_1_dia(lista: list):
-    return fg.media_interv_min(
+    return media_cpu(
         lista,
-        1440,
-        "CPU_PERCENT"
+        "cpu_percent",
+        minutos=1440
     )
 
 
 def media_cpu_user(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "CPU_USER_PERCENT"
+        "cpu_user"
     )
 
 
 def media_cpu_system(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "CPU_SYSTEM_PERCENT"
+        "cpu_system"
     )
 
 
 def media_cpu_idle(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "CPU_IDLE_PERCENT"
+        "cpu_idle"
     )
 
 
 def media_cpu_iowait(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "CPU_IOWAIT_PERCENT"
+        "cpu_iowait"
     )
 
 
 def interrupcoes_por_segundo(lista: list):
-    if len(lista) < 2:
-        return 0
-
-    interrupcoes_inicio = float(
-        lista[0]["CPU_INTERRUPTS"]
+    # A coleta já calculou eventos/s. Aqui fazemos a média dessas leituras.
+    return media_cpu(
+        lista,
+        "cpu_interrupts_per_second"
     )
-
-    interrupcoes_fim = float(
-        lista[-1]["CPU_INTERRUPTS"]
-    )
-
-    data_inicio = datetime.strptime(
-        lista[0]["TIMESTAMP"],
-        '%Y-%m-%d %H:%M:%S'
-    )
-
-    data_fim = datetime.strptime(
-        lista[-1]["TIMESTAMP"],
-        '%Y-%m-%d %H:%M:%S'
-    )
-
-    segundos = (
-        data_fim - data_inicio
-    ).total_seconds()
-
-    if segundos == 0:
-        return 0
-
-    return (
-        interrupcoes_fim - interrupcoes_inicio
-    ) / segundos
 
 
 def media_frequencia_cpu(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "CPU_FREQ_ATUAL"
+        "cpu_freq_current"
     )
 
 
 def media_load_1(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "LOAD_AVG_1"
+        "load_avg_1"
     )
 
 
 def media_load_5(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "LOAD_AVG_5"
+        "load_avg_5"
     )
 
 
 def media_load_15(lista: list):
-    return fg.media_uso_componente(
+    return media_cpu(
         lista,
-        "LOAD_AVG_15"
+        "load_avg_15"
     )
+
+def exibir_valor_cpu(nome, valor, unidade=""):
+    # Tratar ausencia ja feito
+    if valor is None:
+        print(f"{nome} Sem dados válidos")
+    else:
+        ex.resultado(nome, valor, unidade)
+
 
 def exibir_cpu(dados: list):
     ex.titulo("CPU")
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Uso médio geral:",
         media_cpu_geral(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Uso médio últimos 30 min:",
         media_cpu_30_min(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Uso médio último dia:",
         media_cpu_1_dia(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "CPU em user:",
         media_cpu_user(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "CPU em system:",
         media_cpu_system(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "CPU ociosa:",
         media_cpu_idle(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "CPU aguardando I/O:",
         media_cpu_iowait(dados),
         "%"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Interrupções por segundo:",
         interrupcoes_por_segundo(dados),
         "int/s"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Frequência média:",
         media_frequencia_cpu(dados),
         "MHz"
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Load Average 1 min:",
         media_load_1(dados)
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Load Average 5 min:",
         media_load_5(dados)
     )
 
-    ex.resultado(
+    exibir_valor_cpu(
         "Load Average 15 min:",
         media_load_15(dados)
     )
