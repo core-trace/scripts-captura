@@ -2,6 +2,7 @@ import cpu.cpu as cpu
 import ram.ram as ram
 import disco.disco as disco
 import swap.swap as swap
+import rede.rede as rede
 
 def titulo(texto: str):
     print("\n" + "=" * 65)
@@ -21,7 +22,9 @@ def exibir_relatorio(dados: list):
     cpu.exibir_cpu(dados)
     ram.exibir_ram(dados)
     disco.exibir_disco(dados)
+    disco.exibir_io_disco(dados)
     swap.exibir_swap(dados)
+    rede.exibir_rede(dados)
 
     titulo("FIM")
     

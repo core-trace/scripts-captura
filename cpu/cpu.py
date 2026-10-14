@@ -144,6 +144,31 @@ def media_load_15(lista: list):
         "load_avg_15"
     )
 
+def carga_relativa(registro, campo="load_avg_5"):
+    carga = ler_valor_cpu(registro, campo)
+    quantidade = ler_valor_cpu(registro, "cpu_count_logical")
+    if carga is None or carga < 0 or quantidade is None or quantidade <= 0 or not quantidade.is_integer():
+        return None
+    return carga / quantidade
+
+
+def media_carga_relativa(lista, campo="load_avg_5"):
+    # Dividir cada leitura pela capacidade registrada naquela mesma
+    servidores = set(registro.get("ENDERECO_MAC") for registro in lista)
+    if len(servidores) != 1:
+        return None
+    soma = 0
+    quantidade = 0
+    for registro in lista:
+        valor = carga_relativa(registro, campo)
+        if valor is not None:
+            soma += valor
+            quantidade += 1
+    if quantidade == 0:
+        return None
+    return soma / quantidade
+
+
 def exibir_valor_cpu(nome, valor, unidade=""):
     # Tratar ausencia ja feito
     if valor is None:
@@ -223,3 +248,5 @@ def exibir_cpu(dados: list):
         "Load Average 15 min:",
         media_load_15(dados)
     )
+    exibir_valor_cpu("Carga relativa média · 5 min:", media_carga_relativa(dados))
+    exibir_valor_cpu("Carga relativa média · 15 min:", media_carga_relativa(dados, "load_avg_15"))
