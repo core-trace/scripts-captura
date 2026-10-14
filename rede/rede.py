@@ -1,47 +1,99 @@
-import time
-import psutil
+import math
 
-COLUNAS_REDE = [
-    "REDE_BYTES_ENVIADOS_S",
-    "REDE_BYTES_RECEBIDOS_S",
-    "REDE_PACOTES_ENVIADOS_S",
-    "REDE_PACOTES_RECEBIDOS_S",
-    "REDE_ERROS",
-    "REDE_CONEXOES_ESTABELECIDAS",
-]
 
-_anterior = None
-
-def contar_conexoes_estabelecidas():
-    try:
-        conexoes = psutil.net_connections(kind="inet")
-        return sum(1 for c in conexoes if c.status == psutil.CONN_ESTABLISHED)
-
-    except (psutil.AccessDenied, OSError):
+def ler_valor_rede(registro, campo):
+    valor = registro.get(campo)
+    if valor is None or valor == "":
         return None
+    status = registro.get(campo + "_status")
+    if status is not None and status != "ok":
+        return None
+    try:
+        numero = float(valor)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(numero) or numero < 0:
+        return None
+    return numero
 
 
-def coletar_rede():
-    global _anterior
+def coluna_rede(interface, campo):
+    return "rede_" + interface + "_" + campo.removeprefix("net_")
 
-    agora = time.time()
-    io = psutil.net_io_counters()
 
-    # A primeira rodada tem campos vazios; as próximas incluem números.
-    dados: dict[str, int | float | None] = {coluna: None for coluna in COLUNAS_REDE}
-    dados["REDE_ERROS"] = io.errin + io.errout
-    dados["REDE_CONEXOES_ESTABELECIDAS"] = contar_conexoes_estabelecidas()
+def agrupar_rede(lista):
+    # Cada linha geral contém várias interfaces, cada uma em suas próprias colunas.
+    grupos = {}
+    for registro in lista:
+        for coluna in registro:
+            if not coluna.startswith("rede_") or not coluna.endswith("_isup"):
+                continue
+            interface = coluna[len("rede_"):-len("_isup")]
+            chave = (registro.get("ENDERECO_MAC"), interface)
+            if chave not in grupos:
+                grupos[chave] = []
+            grupos[chave].append(registro)
+    return grupos
 
-    if _anterior is not None:
-        intervalo = agora - _anterior["tempo"]
-        antes = _anterior["io"]
 
-        if intervalo > 0:
-            dados["REDE_BYTES_ENVIADOS_S"] = round((io.bytes_sent - antes.bytes_sent) / intervalo, 2)
-            dados["REDE_BYTES_RECEBIDOS_S"] = round((io.bytes_recv - antes.bytes_recv) / intervalo, 2)
-            dados["REDE_PACOTES_ENVIADOS_S"] = round((io.packets_sent - antes.packets_sent) / intervalo, 2)
-            dados["REDE_PACOTES_RECEBIDOS_S"] = round((io.packets_recv - antes.packets_recv) / intervalo, 2)
+def taxa_media_rede(lista, campo, interface=None):
+    grupos = agrupar_rede(lista)
+    if interface is None:
+        if len(grupos) != 1:
+            return None
+        _, interface = next(iter(grupos))
+    selecionados = [chave for chave in grupos if chave[1] == interface]
+    if len(selecionados) != 1:
+        return None
+    registros = grupos[selecionados[0]]
+    total = 0
+    segundos_totais = 0
+    for registro in registros:
+        taxa = ler_valor_rede(registro, coluna_rede(interface, campo))
+        segundos = ler_valor_rede(registro, coluna_rede(interface, "net_interval_seconds"))
+        if taxa is not None and segundos is not None and segundos > 0:
+            total += taxa * segundos
+            segundos_totais += segundos
+    if segundos_totais == 0:
+        return None
+    return total / segundos_totais
 
-    _anterior = {"tempo": agora, "io": io}
 
-    return dados
+def exibir_rede(lista):
+    grupos = agrupar_rede(lista)
+    if len(grupos) == 0:
+        print("Rede: o CSV geral não contém colunas de interfaces.")
+        return
+    campos = {
+        "net_bytes_recv": ("Dados recebidos", "bytes/s"),
+        "net_bytes_sent": ("Dados enviados", "bytes/s"),
+        "net_errin": ("Erros de recebimento", "eventos/s"),
+        "net_errout": ("Erros de envio", "eventos/s"),
+        "net_dropin": ("Descartes na entrada", "pacotes/s"),
+        "net_dropout": ("Descartes na saída", "pacotes/s"),
+        "net_packets_recv": ("Pacotes recebidos", "pacotes/s"),
+        "net_packets_sent": ("Pacotes enviados", "pacotes/s"),
+    }
+    for chave, registros in grupos.items():
+        mac, interface = chave
+        print(f"\nREDE · {mac} · {interface}")
+        # Receber registros em ordem temporal. O estado usa a última linha, sem média.
+        ultima = registros[-1]
+        estado = ler_valor_rede(ultima, coluna_rede(interface, "net_isup"))
+        if estado == 1:
+            print("Estado na última coleta: ativa")
+        elif estado == 0:
+            print("Estado na última coleta: inativa")
+        else:
+            print("Estado na última coleta: indisponível")
+        for campo, (nome, unidade) in campos.items():
+            coluna = coluna_rede(interface, campo)
+            if coluna not in ultima:
+                continue
+            valor = taxa_media_rede(registros, campo, interface)
+            if valor is not None:
+                print(f"{nome}: {valor:.2f} {unidade}")
+            elif all(item.get(coluna + "_status") == "nao_aplicavel" for item in registros):
+                print(f"{nome}: Não aplicável")
+            else:
+                print(f"{nome}: Sem dados válidos")
