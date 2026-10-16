@@ -91,7 +91,7 @@ from rede.coleta import (
 API_BASE_URL = "http://localhost:3333"
 API_FILTRO_URL = "http://localhost:3334"
 
-ARQUIVO_CONFIG = Path(__file__).with_name("config.json")
+ARQUIVO_CONFIG = Path(__file__).resolve().parent.parent / "config.json"
 
 BUCKET = "bucket-coretrace"
 PASTA_S3 = "raw"
