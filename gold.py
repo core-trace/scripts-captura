@@ -22,6 +22,8 @@ def preparar_gold(df, tipo_arquivo):
 
     if tipo_arquivo == "processos":
         obrigatorias.extend(["PID", "NOME"])
+    elif tipo_arquivo == "docker":
+        obrigatorias.append("CONTAINER")
 
     faltantes = [
         coluna
@@ -141,8 +143,17 @@ def processar_gold():
                     dtype={
                         "ENDERECO_MAC": "string",
                         "NOME": "string",
-                        "USUARIO": "string"
+                        "USUARIO": "string",
+                        "CONTAINER": "string"
                     }
+                )
+
+                # Docker compartilha a pasta de processos, mas tem outro esquema.
+                if "CONTAINER" in df.columns and not {"PID", "NOME"}.issubset(df.columns):
+                    tipo_arquivo = "docker"
+
+                pasta_destino = (
+                    "processos" if tipo_arquivo == "docker" else tipo_arquivo
                 )
 
                 df_gold = preparar_gold(
@@ -167,7 +178,7 @@ def processar_gold():
 
                     destino = (
                         f"{GOLD}"
-                        f"{tipo_arquivo}/"
+                        f"{pasta_destino}/"
                         f"maquina={mac}/"
                         f"data={data}/"
                         f"{nome_arquivo}"
