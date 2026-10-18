@@ -18,6 +18,7 @@ CAMPOS_TEXTO = {
     "endereco_mac",
     "nome",
     "usuario",
+    "container",
     "cpu_schema_version",
     "cenario",
     "experimento",
@@ -75,12 +76,15 @@ def identificar_tipo(df):
     if {"PID", "NOME"}.issubset(colunas):
         return "processos"
 
+    if "CONTAINER" in colunas:
+        return "docker"
+
     return "metricas"
 
 
 def transformar_dados(df, tipo_arquivo):
 
-    if tipo_arquivo not in ("metricas", "processos"):
+    if tipo_arquivo not in ("metricas", "processos", "docker"):
         raise ValueError(
             f"Tipo de arquivo desconhecido: {tipo_arquivo}"
         )
@@ -102,6 +106,8 @@ def transformar_dados(df, tipo_arquivo):
 
     if tipo_arquivo == "processos":
         obrigatorias.extend(["PID", "NOME"])
+    elif tipo_arquivo == "docker":
+        obrigatorias.append("CONTAINER")
 
     faltantes = [
         coluna
@@ -171,7 +177,7 @@ def transformar_dados(df, tipo_arquivo):
         if eh_percentual(coluna):
 
             if not (
-                tipo_arquivo == "processos"
+                tipo_arquivo in ("processos", "docker")
                 and coluna.lower() == "cpu_percent"
             ):
                 numeros = numeros.mask(numeros > 100)
@@ -257,14 +263,18 @@ def processar_arquivos():
                     dtype={
                         "ENDERECO_MAC": "string",
                         "NOME": "string",
-                        "USUARIO": "string"
+                        "USUARIO": "string",
+                        "CONTAINER": "string"
                     }
                 )
 
                 tipo_arquivo = identificar_tipo(df)
+                pasta_destino = (
+                    "processos" if tipo_arquivo == "docker" else tipo_arquivo
+                )
 
                 destino = (
-                    f"{SILVER}{tipo_arquivo}/{nome_arquivo}"
+                    f"{SILVER}{pasta_destino}/{nome_arquivo}"
                 )
 
                 try:
