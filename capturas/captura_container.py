@@ -209,81 +209,81 @@ def main(parada=None):
         parada = Event()
 
     cliente = docker.from_env()
-    container = cliente.containers.get("mysql")
-    s3 = boto3.client("s3")
-    rede_anterior = None
+    for container in cliente.containers.list():
+        s3 = boto3.client("s3")
+        rede_anterior = None
 
-    # Cria o CSV na memória e escreve o cabeçalho
-    # O StringIO permite manipular texto como se fosse um arquivo, sem salvá-lo no disco
-    buffer = io.StringIO()
-    escritor = csv.DictWriter(buffer, fieldnames=COLUNAS)
-    escritor.writeheader()
+        # Cria o CSV na memória e escreve o cabeçalho
+        # O StringIO permite manipular texto como se fosse um arquivo, sem salvá-lo no disco
+        buffer = io.StringIO()
+        escritor = csv.DictWriter(buffer, fieldnames=COLUNAS)
+        escritor.writeheader()
 
-    # Controla a quantidade de registros pendentes e o momento do próximo envio
-    quantidade_registros = 0
-    ultimo_envio = time.monotonic()
-    nome_arquivo = criar_nome_arquivo()
+        # Controla a quantidade de registros pendentes e o momento do próximo envio
+        quantidade_registros = 0
+        ultimo_envio = time.monotonic()
+        nome_arquivo = criar_nome_arquivo()
 
 
-    try:
-        while not parada.is_set():
-            try:
-                metricas = coletar_metricas()
-                linha = metricas.copy()
+        try:
+            while not parada.is_set():
+                try:
+                    metricas = coletar_metricas()
+                    linha = metricas.copy()
 
-                # Evita notação científica nas porcentagens do CSV
-                linha["CAMADA_GRAVAVEL_PERCENT"] = (
-                    f'{metricas["CAMADA_GRAVAVEL_PERCENT"]:.10f}'
-                )
-                linha["IMAGEM_PERCENT"] = (
-                    f'{metricas["IMAGEM_PERCENT"]:.8f}'
-                )
+                    # Evita notação científica nas porcentagens do CSV
+                    linha["CAMADA_GRAVAVEL_PERCENT"] = (
+                        f'{metricas["CAMADA_GRAVAVEL_PERCENT"]:.10f}'
+                    )
+                    linha["IMAGEM_PERCENT"] = (
+                        f'{metricas["IMAGEM_PERCENT"]:.8f}'
+                    )
 
-                # Adiciona uma linha ao CSV em memória
-                escritor.writerow(linha)
-                quantidade_registros += 1
+                    # Adiciona uma linha ao CSV em memória
+                    escritor.writerow(linha)
+                    quantidade_registros += 1
 
-                print(
-                    f'{metricas["TIMESTAMP"]} - '
-                    f'Captura realizada para {container.name}'
-                )
+                    print(
+                        f'{metricas["TIMESTAMP"]} - '
+                        f'Captura realizada para {container.name}'
+                    )
 
-                for chave, valor in metricas.items():
-                    if chave == "CAMADA_GRAVAVEL_PERCENT":
-                        print(f"{chave}: {valor:.10f}%")
-                    elif chave == "IMAGEM_PERCENT":
-                        print(f"{chave}: {valor:.8f}%")
-                    else:
-                        print(f"{chave}: {valor}")
+                    for chave, valor in metricas.items():
+                        if chave == "CAMADA_GRAVAVEL_PERCENT":
+                            print(f"{chave}: {valor:.10f}%")
+                        elif chave == "IMAGEM_PERCENT":
+                            print(f"{chave}: {valor:.8f}%")
+                        else:
+                            print(f"{chave}: {valor}")
 
-            except Exception as erro:
-                print(f"Erro na coleta: {erro}")
+                except Exception as erro:
+                    print(f"Erro na coleta: {erro}")
 
-            if time.monotonic() - ultimo_envio >= 60:
-                if quantidade_registros and enviar_s3(
-                    buffer.getvalue(), nome_arquivo
-                ):
-                    buffer.seek(0)
-                    buffer.truncate(0)
-                    escritor.writeheader()
+                if time.monotonic() - ultimo_envio >= 60:
+                    if quantidade_registros and enviar_s3(
+                        buffer.getvalue(), nome_arquivo
+                    ):
+                        buffer.seek(0)
+                        buffer.truncate(0)
+                        escritor.writeheader()
 
-                    quantidade_registros = 0
-                    nome_arquivo = criar_nome_arquivo()
-                    print("Buffer limpo; iniciando novo arquivo.")
+                        quantidade_registros = 0
+                        nome_arquivo = criar_nome_arquivo()
+                        print("Buffer limpo; iniciando novo arquivo.")
 
-                ultimo_envio = time.monotonic()
+                    ultimo_envio = time.monotonic()
 
-            parada.wait(1)
+                parada.wait(1)
 
-    except KeyboardInterrupt:
-        print("\nMonitoramento encerrado.")
+        except KeyboardInterrupt:
+            print("\nMonitoramento encerrado.")
 
-    finally:
-        if quantidade_registros:
-            if not enviar_s3(buffer.getvalue(), nome_arquivo):
-                print("Envio final falhou; os dados restantes não foram enviados.")
+        finally:
+            if quantidade_registros:
+                if not enviar_s3(buffer.getvalue(), nome_arquivo):
+                    print("Envio final falhou; os dados restantes não foram enviados.")
 
-        buffer.close()
+            buffer.close()
 
 
 if __name__ == "__main__":
