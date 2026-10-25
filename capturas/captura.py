@@ -89,7 +89,6 @@ from rede.coleta import (
 )
 
 API_BASE_URL = "http://localhost:3333"
-API_FILTRO_URL = "http://localhost:3334"
 
 ARQUIVO_CONFIG = Path(__file__).resolve().parent.parent / "config.json"
 
@@ -183,7 +182,7 @@ def buscar_metricas_cliente(
 ):
     try:
         resposta = requests.get(
-            f"{API_FILTRO_URL}/empresa/metricas",
+            f"{API_BASE_URL}/empresa/metricas",
             headers={
                 "Authorization": f"Bearer {token_instalacao}",
                 "token-perfil": token_perfil_servidor
