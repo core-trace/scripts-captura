@@ -4,6 +4,7 @@ import time
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
+import json
 
 BUCKET = "bucket-coretrace"
 SILVER = "trusted/"
@@ -65,32 +66,25 @@ def preparar_gold(df, tipo_arquivo):
     return df
 
 
-def arquivo_existe(chave):
+# Função pra converter csv para json
 
-    try:
+def converter_registros(df):
 
-        s3.head_object(
-            Bucket=BUCKET,
-            Key=chave
+    # O drop pra tirar a coluna de data pq hoje em dia usamos a data como parêmetro só pra agrupar os dados
+    # Ignorar erros pq se algum arquivo vier sem essa coluna ele só ignora isso sem dar erro que trave tudo
+    df = df.drop(columns=["DATA"], errors="ignore")
+
+    # Lê o texto json e transforma numa estrutura de lista com dicionários que o python entende
+    return json.loads(
+        # Transforma em json
+        df.to_json(
+            # Cada linha/registro vira um objeto. A coluna vira a chave e o conteúdo vira o valor
+            orient="records",
+            date_format="iso",
+            # Pros acentos e ç e ã ficarem sem bugar
+            force_ascii=False
         )
-
-        return True
-
-    except ClientError as erro:
-
-        codigo = erro.response.get(
-            "Error", {}
-        ).get("Code")
-
-        if codigo in (
-            "404",
-            "NoSuchKey",
-            "NotFound"
-        ):
-            return False
-
-        raise
-
+    )
 
 def processar_gold():
 
@@ -104,6 +98,8 @@ def processar_gold():
         Bucket=BUCKET,
         Prefix=SILVER
     )
+
+    documentos = {}
 
     for pagina in paginas:
 
@@ -152,10 +148,6 @@ def processar_gold():
                 if "CONTAINER" in df.columns and not {"PID", "NOME"}.issubset(df.columns):
                     tipo_arquivo = "docker"
 
-                pasta_destino = (
-                    "processos" if tipo_arquivo == "docker" else tipo_arquivo
-                )
-
                 df_gold = preparar_gold(
                     df,
                     tipo_arquivo
@@ -176,37 +168,26 @@ def processar_gold():
 
                 for (mac, data), grupo in grupos:
 
-                    destino = (
-                        f"{GOLD}"
-                        f"{pasta_destino}/"
-                        f"maquina={mac}/"
-                        f"data={data}/"
-                        f"{nome_arquivo}"
+                    chave_documento = (mac, data)
+
+                    if chave_documento not in documentos:
+                        documentos[chave_documento] = {
+                            "endereco_mac": mac,
+                            "data": data,
+                            "metricas": [],
+                            "processos": [],
+                            "containers": []
+                        }
+
+                    campo = {
+                        "metricas": "metricas",
+                        "processos": "processos",
+                        "docker": "containers"
+                    }[tipo_arquivo]
+
+                    documentos[chave_documento][campo].extend(
+                        converter_registros(grupo)
                     )
-
-                    if arquivo_existe(destino):
-                        print(
-                            "Arquivo ja existe na Gold. Pulando..."
-                        )
-                        continue
-
-                    grupo = grupo.drop(
-                        columns=["DATA"]
-                    )
-
-                    csv_gold = grupo.to_csv(
-                        index=False,
-                        date_format="%Y-%m-%d %H:%M:%S"
-                    )
-
-                    s3.put_object(
-                        Bucket=BUCKET,
-                        Key=destino,
-                        Body=csv_gold.encode("utf-8"),
-                        ContentType="text/csv; charset=utf-8"
-                    )
-
-                    print("Arquivo enviado para:", destino)
 
             except (
                 ValueError,
@@ -220,7 +201,39 @@ def processar_gold():
                 print(
                     f"Erro ao processar {nome_arquivo}: {erro}"
                 )
-                continue
+                # Interrompe antes de enviar
+                raise
+
+    for (mac, data), documento in documentos.items():
+        
+        for campo in ["metricas", "processos", "containers"]:
+            tabela = pd.DataFrame(documento[campo])
+
+            if not tabela.empty:
+                tabela = tabela.drop_duplicates()
+                tabela = tabela.sort_values("TIMESTAMP", kind="stable")
+
+                documento[campo] = converter_registros(tabela)
+        
+        destino = (
+            f"{GOLD}maquina={mac}/"
+            f"data={data}/capturas.json"
+        )
+
+        conteudo = json.dumps(
+            documento,
+            ensure_ascii=False,
+            allow_nan=False
+        )
+
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=destino,
+            Body=conteudo.encode("utf-8"),
+            ContentType="application/json"
+        )
+
+        print("Arquivo JSON enviado para:", destino)
 
     print("\nProcessamento Gold finalizado!")
 
