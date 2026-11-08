@@ -1,0 +1,8 @@
+COLUNAS_EVENTOS = [
+    "TIMESTAMP",
+    "ENDERECO_MAC",
+    "CONTAINER_ID",
+    "CONTAINER",
+    "EVENT_TYPE",
+    "EVENT_ACTION"
+]

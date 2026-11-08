@@ -1,0 +1,8 @@
+COLUNAS_LOGS = [
+    "TIMESTAMP",
+    "ENDERECO_MAC",
+    "CONTAINER_ID",
+    "CONTAINER",
+    "LOG_LEVEL",
+    "LOG_MENSAGEM"
+]
