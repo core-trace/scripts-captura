@@ -10,7 +10,7 @@ from pathlib import Path
 
 # Reutiliza a identificação da máquina utilizada em metricas.py.
 # Os dois arquivos precisam estar na mesma pasta.
-from metricas import obter_endereco_mac
+from .metricas import obter_endereco_mac
 
 
 COLUNAS_LOGS = [

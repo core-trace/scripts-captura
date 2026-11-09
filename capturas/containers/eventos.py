@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Reutiliza o identificador do servidor usado em metricas.py.
-from metricas import obter_endereco_mac
+from .metricas import obter_endereco_mac
 
 
 COLUNAS_EVENTOS = [
