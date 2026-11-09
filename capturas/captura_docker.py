@@ -1,210 +1,129 @@
 
-import json
+import csv
+import io
+import uuid
 import boto3
 
-from pathlib import Path
-from .containers import metricas, logs, eventos
+from datetime import datetime, timezone
+from capturas.containers import metricas, logs, eventos
 
 
 BUCKET = "bucket-coretrace"
 PASTA_S3 = "raw/docker"
 
-# Mantemos os arquivos dentro da pasta de containers.
-DIRETORIO_BASE = Path(metricas.__file__).resolve().parent
-DIRETORIO_CSV = DIRETORIO_BASE / "csv"
-DIRETORIO_PENDENTES = DIRETORIO_BASE / "estado" / "pendentes"
 
+def enviar_csv_s3(s3, tipo, dados, colunas):
+    # Não criamos arquivos quando não existem registros.
+    if not dados:
+        return None
 
-def criar_pendencia(tipo, caminho_csv, checkpoint=None):
-    """
-    Registra um CSV que ainda precisa ser enviado ao S3.
-
-    O checkpoint fica associado ao CSV para que ele
-    só seja confirmado após o upload.
-    """
-
-    DIRETORIO_PENDENTES.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    caminho_csv = Path(caminho_csv).resolve()
-
-    pendencia = {
-        "arquivo": str(caminho_csv),
-        "chave_s3": f"{PASTA_S3}/{tipo}/{caminho_csv.name}",
-        "checkpoint": checkpoint
-    }
-
-    caminho_pendencia = DIRETORIO_PENDENTES / f"{tipo}.json"
-    temporario = caminho_pendencia.with_suffix(".tmp")
-
-    # Escreve primeiro em um arquivo temporário.
-    # Isso reduz o risco de deixar um JSON incompleto.
-    with open(temporario, "w", encoding="utf-8") as arquivo:
-        json.dump(
-            pendencia,
-            arquivo,
-            indent=4,
-            ensure_ascii=False
-        )
-
-    temporario.replace(caminho_pendencia)
-
-
-def enviar_pendente(tipo, s3, confirmar_checkpoint=None):
-    """
-    Envia o CSV pendente e confirma o checkpoint
-    somente depois do sucesso no S3.
-
-    Retorna True se não houver pendências ou se o
-    envio for concluído. False se o envio falhar.
-    """
-
-    caminho_pendencia = DIRETORIO_PENDENTES / f"{tipo}.json"
-
-    if not caminho_pendencia.exists():
-        return True
-
-    with open(caminho_pendencia, "r", encoding="utf-8") as arquivo:
-        pendencia = json.load(arquivo)
-
-    caminho_csv = Path(pendencia["arquivo"])
-    chave_s3 = pendencia["chave_s3"]
-
-    # Se o arquivo desapareceu, interrompemos esse tipo
-    # de captura. Não podemos avançar o checkpoint.
-    if not caminho_csv.is_file():
-        print(f"[ERRO] Arquivo pendente não encontrado: {caminho_csv}")
-        return False
+    # StringIO cria um arquivo de texto em memória.
+    # Assim, não precisamos salvar um CSV no disco.
+    buffer = io.StringIO(newline="")
 
     try:
-        # Envia o arquivo CSV diretamente do disco.
-        s3.upload_file(
-            Filename=str(caminho_csv),
-            Bucket=BUCKET,
-            Key=chave_s3,
-            ExtraArgs={
-                "ContentType": "text/csv; charset=utf-8"
-            }
+        # Monta o CSV diretamente na memória,
+        # mantendo as colunas definidas em cada módulo.
+        escritor = csv.DictWriter(
+            buffer,
+            fieldnames=colunas,
+            delimiter=";"
         )
 
-        print(f"[S3] Enviado: s3://{BUCKET}/{chave_s3}")
+        escritor.writeheader()
+        escritor.writerows(dados)
 
-    except Exception as erro:
-        # Preservamos o arquivo e a pendência local.
-        # Na próxima execução tentaremos novamente.
-        print(f"[S3] Falha no envio de {tipo}: {erro}")
-        return False
+        # Converte o conteúdo em bytes para enviar ao S3.
+        conteudo = buffer.getvalue().encode("utf-8")
 
-    # O upload terminou com sucesso.
-    # Agora podemos confirmar a posição processada.
-    checkpoint = pendencia.get("checkpoint")
+    finally:
+        # Libera o buffer após obter seu conteúdo.
+        buffer.close()
 
-    if confirmar_checkpoint is not None and checkpoint is not None:
-        confirmar_checkpoint(checkpoint)
+    # Nome único para cada lote de captura.
+    horario = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
 
-    # Só removemos a pendência depois de confirmar
-    # o checkpoint. O CSV local é preservado.
-    caminho_pendencia.unlink()
+    identificador = uuid.uuid4().hex[:8]
 
-    return True
+    nome_arquivo = (
+        f"{tipo}_{horario}_{identificador}.csv"
+    )
+
+    # Separamos os CSVs por tipo para facilitar a ETL.
+    chave = f"{PASTA_S3}/{tipo}/{nome_arquivo}"
+
+    # Envia diretamente para o S3, sem arquivo local.
+    # Se ocorrer uma exceção, ela será tratada pela
+    # função principal e o checkpoint não avançará.
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=chave,
+        Body=conteudo,
+        ContentType="text/csv; charset=utf-8"
+    )
+
+    print(f"[S3] Enviado: s3://{BUCKET}/{chave}")
+
+    return chave
 
 
 def processar_coleta(
+    s3,
     tipo,
     coletor,
-    gerador_csv,
-    s3,
+    colunas,
     confirmar_checkpoint=None
 ):
-    """
-    Fluxo comum para métricas, logs e eventos:
-
-    1. Reenvia possíveis arquivos pendentes.
-    2. Executa a captura.
-    3. Gera um CSV.
-    4. Registra a pendência.
-    5. Envia ao S3.
-    6. Confirma o checkpoint após o envio.
-    """
-
-    # Primeiro resolvemos a pendência anterior.
-    # Isso evita abandonar um CSV quando o S3 falhar.
-    if not enviar_pendente(
-        tipo,
-        s3,
-        confirmar_checkpoint
-    ):
-        print(f"[{tipo.upper()}] Upload pendente. Nova coleta adiada.")
-        return
-
-    # Todas as funções de coleta devem retornar:
-    # (lista_de_registros, checkpoint)
+    # Cada coletor retorna os registros e, quando
+    # aplicável, o estado da leitura realizada.
     dados, checkpoint = coletor()
 
-    if not dados:
-        print(f"[{tipo.upper()}] Nenhum registro novo.")
-
-        # Se não houve registros, não há CSV para enviar.
-        # Podemos salvar a posição da consulta concluída.
-        if confirmar_checkpoint is not None and checkpoint is not None:
-            confirmar_checkpoint(checkpoint)
-
-        return
-
-    # O CSV é gerado antes de qualquer tentativa de envio.
-    caminho_csv = gerador_csv(dados)
-
-    if caminho_csv is None:
-        raise RuntimeError(
-            f"A coleta {tipo} retornou dados, mas não gerou CSV."
+    if dados:
+        # O upload precisa terminar com sucesso antes
+        # de confirmarmos que os registros foram processados.
+        enviar_csv_s3(
+            s3=s3,
+            tipo=tipo,
+            dados=dados,
+            colunas=colunas
         )
 
-    print(
-        f"[{tipo.upper()}] "
-        f"{len(dados)} registros capturados."
-    )
+        print(
+            f"[{tipo.upper()}] "
+            f"{len(dados)} registros enviados."
+        )
 
-    # Registra o arquivo e o checkpoint associado.
-    # Se o envio falhar, ambos poderão ser recuperados.
-    criar_pendencia(
-        tipo,
-        caminho_csv,
-        checkpoint
-    )
+    else:
+        print(f"[{tipo.upper()}] Nenhum registro novo.")
 
-    # Tenta entregar o arquivo recém-gerado.
-    enviar_pendente(
-        tipo,
-        s3,
-        confirmar_checkpoint
-    )
+    # Logs e eventos possuem checkpoints.
+    #
+    # Se havia dados, só chegamos aqui após o upload.
+    # Se não havia dados, a consulta foi concluída
+    # e podemos atualizar o estado normalmente.
+    if (
+        confirmar_checkpoint is not None
+        and checkpoint is not None
+    ):
+        confirmar_checkpoint(checkpoint)
 
 
 def main():
-    """
-    Executa uma rodada completa de captura Docker.
-
-    Não possui while infinito: o main principal do
-    CoreTrace controla o agendamento das coletas.
-    """
-
     print("\n[DOCKER] Iniciando rodada de captura...")
 
-    # Uma única instância do cliente S3 por rodada.
+    # Uma conexão S3 compartilhada pelos três módulos.
     s3 = boto3.client("s3")
 
-    # Utilizamos o mesmo MAC nos três arquivos.
+    # Usa o mesmo MAC em métricas, logs e eventos.
     endereco_mac = metricas.obter_endereco_mac()
 
+    # Cada módulo mantém sua responsabilidade.
+    # O orquestrador apenas executa e envia os dados.
     tarefas = [
         (
             "metricas",
-
-            # Captura de todos os containers.
-            # Armazenamento desativado por padrão para
-            # reduzir o custo das coletas frequentes.
             lambda: (
                 metricas.capturar_metricas(
                     incluir_armazenamento=False,
@@ -212,53 +131,49 @@ def main():
                 ),
                 None
             ),
-
-            lambda dados: metricas.gerar_csv(
-                dados,
-                diretorio=DIRETORIO_CSV
-            ),
-
+            metricas.COLUNAS_METRICAS,
             None
         ),
         (
             "logs",
-
-            # Captura apenas mensagens ainda não processadas.
             lambda: logs.capturar_logs(
                 endereco_mac=endereco_mac
             ),
-
-            logs.gerar_csv,
+            logs.COLUNAS_LOGS,
             logs.salvar_estado
         ),
         (
             "eventos",
-
-            # Captura acontecimentos desde o checkpoint.
             lambda: eventos.capturar_eventos(
                 endereco_mac=endereco_mac
             ),
-
-            eventos.gerar_csv,
+            eventos.COLUNAS_EVENTOS,
             eventos.salvar_estado
         )
     ]
 
-    # Tratamos erros individualmente.
-    # Uma falha em métricas não deve impedir a
-    # execução das capturas de logs e eventos.
-    for tipo, coletor, gerador, confirmar in tarefas:
+    # Executamos as capturas separadamente.
+    # Uma falha em um módulo não deve impedir
+    # que os outros dois sejam executados.
+    for tipo, coletor, colunas, confirmar in tarefas:
         try:
             processar_coleta(
+                s3=s3,
                 tipo=tipo,
                 coletor=coletor,
-                gerador_csv=gerador,
-                s3=s3,
+                colunas=colunas,
                 confirmar_checkpoint=confirmar
             )
 
         except Exception as erro:
-            print(f"[ERRO] Captura de {tipo}: {erro}")
+            # Em caso de falha no envio, o checkpoint
+            # não é atualizado.
+            #
+            # Na próxima execução, logs e eventos
+            # poderão tentar recuperar os registros.
+            print(
+                f"[ERRO] Captura de {tipo}: {erro}"
+            )
 
     print("[DOCKER] Rodada finalizada.\n")
 
