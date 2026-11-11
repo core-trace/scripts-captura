@@ -311,13 +311,22 @@ def processar_arquivos():
                 )
 
                 tipo_arquivo = identificar_tipo(df)
-                pasta_destino = (
-                    "processos" if tipo_arquivo == "docker" else tipo_arquivo
-                )
 
-                destino = (
-                    f"{SILVER}{pasta_destino}/{nome_arquivo}"
-                )
+                # Relaciona cada tipo de arquivo à sua pasta na Silver.
+                # Mantemos as pastas antigas e separamos os dados do Docker.
+                pastas_destino = {
+                    "metricas": "metricas",
+                    "processos": "processos",
+                    "docker_metricas": "docker/metricas",
+                    "docker_eventos": "docker/eventos",
+                    "docker_logs": "docker/logs"
+                }
+
+                # Obtém a pasta correspondente ao tipo identificado.
+                pasta_destino = pastas_destino[tipo_arquivo]
+
+                # Monta o caminho completo do arquivo na Silver.
+                destino = f"{SILVER}{pasta_destino}/{nome_arquivo}"
 
                 try:
 
