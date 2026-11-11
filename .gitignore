@@ -3,6 +3,8 @@ tests
 .venv
 __pycache__/
 __init__.py
+
+capturas/containers/estado
 teste-local
 teste_local.py
 exemplos
