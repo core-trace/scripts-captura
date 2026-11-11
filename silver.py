@@ -12,7 +12,6 @@ SILVER = "trusted/"
 
 s3 = boto3.client("s3")
 
-
 CAMPOS_TEXTO = {
     "timestamp",
     "endereco_mac",
@@ -22,7 +21,27 @@ CAMPOS_TEXTO = {
     "cpu_schema_version",
     "cenario",
     "experimento",
-    "ram_oom_boot_id"
+    "ram_oom_boot_id",
+
+    # Identificação do Docker
+    "container_id",
+    "imagem",
+    "status",
+    "oom_killed",
+
+    # Datas do contêiner
+    "started_at",
+    "finished_at",
+
+    # Eventos do Docker
+    "event_id",
+    "event_type",
+    "event_action",
+    "event_details",
+
+    # Logs do Docker
+    "log_level",
+    "log_mensagem"
 }
 
 
@@ -77,14 +96,33 @@ def identificar_tipo(df):
         return "processos"
 
     if "CONTAINER" in colunas:
-        return "docker"
+
+        # Identifica eventos pelas colunas específicas
+        if {"EVENT_TYPE", "EVENT_ACTION"}.issubset(colunas):
+            return "docker_eventos"
+
+        # Identifica logs pela coluna de mensagem
+        if "LOG_MENSAGEM" in colunas:
+            return "docker_logs"
+
+        # Identifica métricas pelas colunas de utilização
+        if {"CPU_PERCENT", "RAM_PERCENT"}.issubset(colunas):
+            return "docker_metricas"
+
+        raise ValueError("Tipo de CSV Docker desconhecido")
 
     return "metricas"
 
 
 def transformar_dados(df, tipo_arquivo):
 
-    if tipo_arquivo not in ("metricas", "processos", "docker"):
+    if tipo_arquivo not in (
+        "metricas",
+        "processos",
+        "docker_metricas",
+        "docker_eventos",
+        "docker_logs"
+    ):
         raise ValueError(
             f"Tipo de arquivo desconhecido: {tipo_arquivo}"
         )
@@ -106,8 +144,9 @@ def transformar_dados(df, tipo_arquivo):
 
     if tipo_arquivo == "processos":
         obrigatorias.extend(["PID", "NOME"])
-    elif tipo_arquivo == "docker":
-        obrigatorias.append("CONTAINER")
+
+    elif tipo_arquivo.startswith("docker_"):
+        obrigatorias.extend(["CONTAINER_ID", "CONTAINER"])
 
     faltantes = [
         coluna
@@ -177,8 +216,8 @@ def transformar_dados(df, tipo_arquivo):
         if eh_percentual(coluna):
 
             if not (
-                tipo_arquivo in ("processos", "docker")
-                and coluna.lower() == "cpu_percent"
+                tipo_arquivo in ("processos", "docker_metricas")
+                and coluna.lower() == "cpu_percent"    
             ):
                 numeros = numeros.mask(numeros > 100)
 
@@ -213,7 +252,7 @@ def transformar_dados(df, tipo_arquivo):
             ]
         )
 
-    else:
+    elif tipo_arquivo in ("metricas", "docker_metricas"):
         df = df.drop_duplicates()
 
     df = df.sort_values("TIMESTAMP")
@@ -259,7 +298,10 @@ def processar_arquivos():
 
                 df = pd.read_csv(
                     io.BytesIO(conteudo),
-                    low_memory=False,
+
+                    # Aceitar qualquer separador
+                    sep=None,
+                    engine="python",
                     dtype={
                         "ENDERECO_MAC": "string",
                         "NOME": "string",
