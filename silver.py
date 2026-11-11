@@ -12,7 +12,6 @@ SILVER = "trusted/"
 
 s3 = boto3.client("s3")
 
-
 CAMPOS_TEXTO = {
     "timestamp",
     "endereco_mac",
@@ -22,7 +21,27 @@ CAMPOS_TEXTO = {
     "cpu_schema_version",
     "cenario",
     "experimento",
-    "ram_oom_boot_id"
+    "ram_oom_boot_id",
+
+    # Identificação do Docker
+    "container_id",
+    "imagem",
+    "status",
+    "oom_killed",
+
+    # Datas do contêiner
+    "started_at",
+    "finished_at",
+
+    # Eventos do Docker
+    "event_id",
+    "event_type",
+    "event_action",
+    "event_details",
+
+    # Logs do Docker
+    "log_level",
+    "log_mensagem"
 }
 
 
@@ -77,14 +96,33 @@ def identificar_tipo(df):
         return "processos"
 
     if "CONTAINER" in colunas:
-        return "docker"
+
+        # Identifica eventos pelas colunas específicas
+        if {"EVENT_TYPE", "EVENT_ACTION"}.issubset(colunas):
+            return "docker_eventos"
+
+        # Identifica logs pela coluna de mensagem
+        if "LOG_MENSAGEM" in colunas:
+            return "docker_logs"
+
+        # Identifica métricas pelas colunas de utilização
+        if {"CPU_PERCENT", "RAM_PERCENT"}.issubset(colunas):
+            return "docker_metricas"
+
+        raise ValueError("Tipo de CSV Docker desconhecido")
 
     return "metricas"
 
 
 def transformar_dados(df, tipo_arquivo):
 
-    if tipo_arquivo not in ("metricas", "processos", "docker"):
+    if tipo_arquivo not in (
+        "metricas",
+        "processos",
+        "docker_metricas",
+        "docker_eventos",
+        "docker_logs"
+    ):
         raise ValueError(
             f"Tipo de arquivo desconhecido: {tipo_arquivo}"
         )
@@ -106,8 +144,9 @@ def transformar_dados(df, tipo_arquivo):
 
     if tipo_arquivo == "processos":
         obrigatorias.extend(["PID", "NOME"])
-    elif tipo_arquivo == "docker":
-        obrigatorias.append("CONTAINER")
+
+    elif tipo_arquivo.startswith("docker_"):
+        obrigatorias.extend(["CONTAINER_ID", "CONTAINER"])
 
     faltantes = [
         coluna
@@ -120,25 +159,60 @@ def transformar_dados(df, tipo_arquivo):
             f"Colunas obrigatorias ausentes: {faltantes}"
         )
 
-    df = df.replace(r"^\s*$", pd.NA, regex=True)
+    # Identifica as colunas que podem passar pela limpeza.
+    # A mensagem de log deve manter sua formatação original.
+    colunas_limpeza = [
+        coluna
+        for coluna in df.columns
+        if not (
+            tipo_arquivo == "docker_logs"
+            and coluna == "LOG_MENSAGEM"
+        )
+    ]
+
+    df[colunas_limpeza] = df[colunas_limpeza].replace(
+        r"^\s*$",
+        pd.NA,
+        regex=True
+    )
+
     df = df.dropna(how="all")
 
     for coluna in df.select_dtypes(
         include=["object", "string"]
     ).columns:
 
-        df[coluna] = (
-            df[coluna]
-            .astype("string")
-            .str.strip()
-        )
+        # Converte para string mantendo um tipo consistente.
+        df[coluna] = df[coluna].astype("string")
+
+        # Não remove espaços das mensagens de logs,
+        # pois a indentação pode ter significado.
+        if tipo_arquivo == "docker_logs" and coluna == "LOG_MENSAGEM":
+            continue
+
+        # Mantém a limpeza original nas demais colunas.
+        df[coluna] = df[coluna].str.strip()
 
         df[coluna] = df[coluna].replace("", pd.NA)
 
-    df["TIMESTAMP"] = pd.to_datetime(
-        df["TIMESTAMP"],
-        errors="coerce"
-    )
+        if tipo_arquivo.startswith("docker_"):
+
+            # Os timestamps do Docker utilizam formato ISO 8601,
+            # com precisão de até nanossegundos e fuso UTC.
+            df["TIMESTAMP"] = pd.to_datetime(
+                df["TIMESTAMP"],
+                errors="coerce",
+                format="ISO8601",
+                utc=True
+            )
+
+        else:
+
+            # Mantém o comportamento original para os CSVs antigos.
+            df["TIMESTAMP"] = pd.to_datetime(
+                df["TIMESTAMP"],
+                errors="coerce"
+            )
 
     df["ENDERECO_MAC"] = (
         df["ENDERECO_MAC"]
@@ -153,6 +227,19 @@ def transformar_dados(df, tipo_arquivo):
     df = df[
         df["ENDERECO_MAC"].ne("").fillna(False)
     ]
+
+    if tipo_arquivo == "docker_metricas":
+        # Converte as datas de início e encerramento.
+        # Datas inválidas ou não definidas tornam-se NaT.
+        for coluna in ("STARTED_AT", "FINISHED_AT"):
+
+            if coluna in df.columns:
+                df[coluna] = pd.to_datetime(
+                    df[coluna],
+                    errors="coerce",
+                    format="ISO8601",
+                    utc=True
+                )
 
     colunas_numericas = [
         coluna
@@ -177,8 +264,8 @@ def transformar_dados(df, tipo_arquivo):
         if eh_percentual(coluna):
 
             if not (
-                tipo_arquivo in ("processos", "docker")
-                and coluna.lower() == "cpu_percent"
+                tipo_arquivo in ("processos", "docker_metricas")
+                and coluna.lower() == "cpu_percent"    
             ):
                 numeros = numeros.mask(numeros > 100)
 
@@ -213,7 +300,7 @@ def transformar_dados(df, tipo_arquivo):
             ]
         )
 
-    else:
+    elif tipo_arquivo in ("metricas", "docker_metricas"):
         df = df.drop_duplicates()
 
     df = df.sort_values("TIMESTAMP")
@@ -259,7 +346,10 @@ def processar_arquivos():
 
                 df = pd.read_csv(
                     io.BytesIO(conteudo),
-                    low_memory=False,
+
+                    # Aceitar qualquer separador
+                    sep=None,
+                    engine="python",
                     dtype={
                         "ENDERECO_MAC": "string",
                         "NOME": "string",
@@ -269,13 +359,22 @@ def processar_arquivos():
                 )
 
                 tipo_arquivo = identificar_tipo(df)
-                pasta_destino = (
-                    "processos" if tipo_arquivo == "docker" else tipo_arquivo
-                )
 
-                destino = (
-                    f"{SILVER}{pasta_destino}/{nome_arquivo}"
-                )
+                # Relaciona cada tipo de arquivo à sua pasta na Silver.
+                # Mantemos as pastas antigas e separamos os dados do Docker.
+                pastas_destino = {
+                    "metricas": "metricas",
+                    "processos": "processos",
+                    "docker_metricas": "docker/metricas",
+                    "docker_eventos": "docker/eventos",
+                    "docker_logs": "docker/logs"
+                }
+
+                # Obtém a pasta correspondente ao tipo identificado.
+                pasta_destino = pastas_destino[tipo_arquivo]
+
+                # Monta o caminho completo do arquivo na Silver.
+                destino = f"{SILVER}{pasta_destino}/{nome_arquivo}"
 
                 try:
 
@@ -311,10 +410,20 @@ def processar_arquivos():
                     print("Arquivo sem registros validos.")
                     continue
 
-                csv_tratado = df_limpo.to_csv(
-                    index=False,
-                    date_format="%Y-%m-%d %H:%M:%S"
-                )
+                if tipo_arquivo.startswith("docker_"):
+
+                    # Preserva a precisão dos timestamps do Docker.
+                    csv_tratado = df_limpo.to_csv(
+                        index=False
+                    )
+
+                else:
+
+                    # Mantém o formato original dos arquivos antigos.
+                    csv_tratado = df_limpo.to_csv(
+                        index=False,
+                        date_format="%Y-%m-%d %H:%M:%S"
+                    )
 
                 s3.put_object(
                     Bucket=BUCKET,
