@@ -36,8 +36,14 @@ def preparar_gold(df, tipo_arquivo):
 
     if tipo_arquivo == "processos":
         obrigatorias.extend(["PID", "NOME"])
-    elif tipo_arquivo == "docker":
-        obrigatorias.append("CONTAINER")
+
+    elif tipo_arquivo in (
+        "docker_metricas",
+        "docker_eventos",
+        "docker_logs"
+    ):
+        # O ID identifica o contêiner mesmo quando seu nome muda.
+        obrigatorias.extend(["CONTAINER_ID", "CONTAINER"])
 
     faltantes = []
     for coluna in obrigatorias:
@@ -49,12 +55,25 @@ def preparar_gold(df, tipo_arquivo):
             f"Colunas obrigatorias ausentes: {faltantes}"
         )
 
-    # Uma data inválida interrompe em vez de apagar a linha
-    df["TIMESTAMP"] = pd.to_datetime(
-        df["TIMESTAMP"],
-        errors="raise",
-        format="ISO8601"
-    )
+    if tipo_arquivo.startswith("docker_"):
+
+        # O Docker registra timestamps com informações de fuso.
+        # Padronizamos todos os horários em UTC.
+        df["TIMESTAMP"] = pd.to_datetime(
+            df["TIMESTAMP"],
+            errors="raise",
+            format="ISO8601",
+            utc=True
+        )
+
+    else:
+
+        # Mantém o tratamento original dos arquivos antigos.
+        df["TIMESTAMP"] = pd.to_datetime(
+            df["TIMESTAMP"],
+            errors="raise",
+            format="ISO8601"
+        )
 
     # O mesmo MAC com hífen ou dois pontos vai pra mesma pasta
     df["ENDERECO_MAC"] = (
@@ -87,11 +106,27 @@ def preparar_gold(df, tipo_arquivo):
             raise ValueError("PID ou nome do processo invalido")
         df["PID"] = pids.astype("Int64")
         
-    elif tipo_arquivo == "docker" and df["CONTAINER"].astype("string").str.strip().eq("").any():
-        raise ValueError("Nome do container vazio")
+    elif tipo_arquivo.startswith("docker_"):
 
-    if df["TIMESTAMP"].dt.tz is not None:
-        raise ValueError("As capturas atuais devem usar horario local sem fuso")
+        # O contêiner precisa de ID e nome para ser identificado.
+        # Também impedimos identificadores compostos apenas por espaços.
+        for coluna in ("CONTAINER_ID", "CONTAINER"):
+
+            valores = df[coluna].astype("string").str.strip()
+
+            if valores.isna().any() or valores.eq("").any():
+                raise ValueError(
+                    f"Identificacao do container invalida: {coluna}"
+                )
+
+    # As capturas tradicionais continuam utilizando horário local sem fuso.
+    # Os arquivos Docker já foram normalizados para UTC.
+    if not tipo_arquivo.startswith("docker_"):
+
+        if df["TIMESTAMP"].dt.tz is not None:
+            raise ValueError(
+                "As capturas atuais devem usar horario local sem fuso"
+            )
 
     df = df.sort_values(
         ["ENDERECO_MAC", "TIMESTAMP"]
