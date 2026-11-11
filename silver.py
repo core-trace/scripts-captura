@@ -174,10 +174,24 @@ def transformar_dados(df, tipo_arquivo):
 
         df[coluna] = df[coluna].replace("", pd.NA)
 
-    df["TIMESTAMP"] = pd.to_datetime(
-        df["TIMESTAMP"],
-        errors="coerce"
-    )
+        if tipo_arquivo.startswith("docker_"):
+
+            # Os timestamps do Docker utilizam formato ISO 8601,
+            # com precisão de até nanossegundos e fuso UTC.
+            df["TIMESTAMP"] = pd.to_datetime(
+                df["TIMESTAMP"],
+                errors="coerce",
+                format="ISO8601",
+                utc=True
+            )
+
+        else:
+
+            # Mantém o comportamento original para os CSVs antigos.
+            df["TIMESTAMP"] = pd.to_datetime(
+                df["TIMESTAMP"],
+                errors="coerce"
+            )
 
     df["ENDERECO_MAC"] = (
         df["ENDERECO_MAC"]
@@ -192,6 +206,19 @@ def transformar_dados(df, tipo_arquivo):
     df = df[
         df["ENDERECO_MAC"].ne("").fillna(False)
     ]
+
+    if tipo_arquivo == "docker_metricas":
+        # Converte as datas de início e encerramento.
+        # Datas inválidas ou não definidas tornam-se NaT.
+        for coluna in ("STARTED_AT", "FINISHED_AT"):
+
+            if coluna in df.columns:
+                df[coluna] = pd.to_datetime(
+                    df[coluna],
+                    errors="coerce",
+                    format="ISO8601",
+                    utc=True
+                )
 
     colunas_numericas = [
         coluna
@@ -362,10 +389,20 @@ def processar_arquivos():
                     print("Arquivo sem registros validos.")
                     continue
 
-                csv_tratado = df_limpo.to_csv(
-                    index=False,
-                    date_format="%Y-%m-%d %H:%M:%S"
-                )
+                if tipo_arquivo.startswith("docker_"):
+
+                    # Preserva a precisão dos timestamps do Docker.
+                    csv_tratado = df_limpo.to_csv(
+                        index=False
+                    )
+
+                else:
+
+                    # Mantém o formato original dos arquivos antigos.
+                    csv_tratado = df_limpo.to_csv(
+                        index=False,
+                        date_format="%Y-%m-%d %H:%M:%S"
+                    )
 
                 s3.put_object(
                     Bucket=BUCKET,
