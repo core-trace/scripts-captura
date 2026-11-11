@@ -152,24 +152,87 @@ def ler_arquivo(chave, tipo_arquivo):
 
     # Esses campos são texto mesmo quando parecem números, como um boot ID com zeros na frente
     colunas_texto = {
-        "ENDERECO_MAC": "string", "NOME": "string", "USUARIO": "string",
-        "CONTAINER": "string", "RAM_OOM_BOOT_ID": "string", "CPU_SCHEMA_VERSION": "string"
+        "ENDERECO_MAC": "string",
+        "NOME": "string",
+        "USUARIO": "string",
+        "CONTAINER": "string",
+        "RAM_OOM_BOOT_ID": "string",
+        "CPU_SCHEMA_VERSION": "string",
+
+        # Identificação e informações do contêiner
+        "CONTAINER_ID": "string",
+        "IMAGEM": "string",
+        "STATUS": "string",
+        "HEALTH_STATUS": "string",
+        "OOM_KILLED": "string",
+        "STARTED_AT": "string",
+        "FINISHED_AT": "string",
+
+        # Eventos
+        "EVENT_ID": "string",
+        "EVENT_TYPE": "string",
+        "EVENT_ACTION": "string",
+        "EVENT_DETAILS": "string",
+
+        # Logs
+        "LOG_LEVEL": "string",
+        "LOG_MENSAGEM": "string"
     }
     
     df = pd.read_csv(
         io.StringIO(texto), header=0, names=colunas, low_memory=False,
         keep_default_na=False, na_values=[""], dtype=colunas_texto
     )
-    
-    # NA e NULL podem ser nomes de verdade. Só o campo vazio é tratado como ausência
 
-    tem_campos_processo = "PID" in df.columns or "NOME" in df.columns
-    if "CONTAINER" in df.columns:
-        if tem_campos_processo or tipo_arquivo != "processos":
-            raise ValueError("Esquema de container incompativel com a origem")
-        tipo_arquivo = "docker"
-    elif tipo_arquivo == "metricas" and tem_campos_processo:
-        raise ValueError("Processos recebidos na pasta de metricas")
+    # Colunas obrigatórias para cada tipo de arquivo Docker.
+    # Isso evita processar um CSV na categoria errada.
+    esquemas_docker = {
+        "docker_metricas": {
+            "CONTAINER_ID",
+            "CONTAINER",
+            "CPU_PERCENT",
+            "RAM_PERCENT"
+        },
+        "docker_eventos": {
+            "CONTAINER_ID",
+            "CONTAINER",
+            "EVENT_ID",
+            "EVENT_TYPE",
+            "EVENT_ACTION"
+        },
+        "docker_logs": {
+            "CONTAINER_ID",
+            "CONTAINER",
+            "LOG_MENSAGEM"
+        }
+    }
+    
+    if tipo_arquivo in esquemas_docker:
+
+        obrigatorias = esquemas_docker[tipo_arquivo]
+
+        faltantes = obrigatorias - set(df.columns)
+
+        if faltantes:
+            raise ValueError(
+                f"Colunas Docker ausentes: {sorted(faltantes)}"
+            )
+
+    elif tipo_arquivo == "processos":
+
+        if not {"PID", "NOME"}.issubset(df.columns):
+            raise ValueError("Esquema de processos invalido")
+
+        if "CONTAINER" in df.columns:
+            raise ValueError("Container recebido na pasta de processos")
+
+    elif tipo_arquivo == "metricas":
+
+        if {"PID", "NOME", "CONTAINER"} & set(df.columns):
+            raise ValueError("Esquema incompativel com metricas")
+
+    else:
+        raise ValueError(f"Tipo de arquivo desconhecido: {tipo_arquivo}")
 
     # Esse hash identifica o conteúdo de origem
     hash_origem = hashlib.sha256(conteudo).hexdigest()
@@ -297,6 +360,18 @@ def processar_gold():
                         tipo = "metricas"
                     elif chave.startswith(SILVER + "processos/"):
                         tipo = "processos"
+
+                    # Identifica os três tipos de arquivos Docker.
+                    # Cada um terá seu próprio tratamento no formato_gold.
+                    elif chave.startswith(SILVER + "docker/metricas/"):
+                        tipo = "docker_metricas"
+
+                    elif chave.startswith(SILVER + "docker/eventos/"):
+                        tipo = "docker_eventos"
+
+                    elif chave.startswith(SILVER + "docker/logs/"):
+                        tipo = "docker_logs"
+
                     else:
                         print("Arquivo ignorado:", chave)
                         continue
