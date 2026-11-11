@@ -220,6 +220,44 @@ CAMPOS_CONTAINER = {
     }
 }
 
+# Mapeamento das métricas Docker coletadas em bytes e contadores.
+# Diferenciamos medições instantâneas de contadores acumulados,
+# pois não podem receber a mesma regra de agregação.
+CAMPOS_CONTAINER_DOCKER = {
+    "cpu": {
+        "uso": ("CPU_PERCENT", None, "%", "medicao"),
+        "tempo_total": ("CPU_TOTAL_USAGE", None, "ns", "contador_acumulado"),
+        "tempo_sistema": ("CPU_SYSTEM_USAGE", None, "ns", "contador_acumulado"),
+        "nucleos": ("CPU_ONLINE_CPUS", None, "núcleos", "inventario"),
+        "tempo_throttled": ("CPU_THROTTLED_TIME", None, "ns", "contador_acumulado"),
+        "periodos_throttled": ("CPU_THROTTLED_PERIODS", None, "ocorrências", "contador_acumulado")
+    },
+    "memoria": {
+        "uso": ("RAM_PERCENT", None, "%", "medicao"),
+        "utilizada": ("RAM_USAGE_BYTES", None, "bytes", "medicao"),
+        "limite": ("RAM_LIMIT_BYTES", None, "bytes", "inventario")
+    },
+    "rede": {
+        "recebidos": ("REDE_RECEBIDA_BYTES", None, "bytes", "contador_acumulado"),
+        "enviados": ("REDE_ENVIADA_BYTES", None, "bytes", "contador_acumulado"),
+        "erros_recebidos": ("NET_RX_ERRORS", None, "ocorrências", "contador_acumulado"),
+        "erros_enviados": ("NET_TX_ERRORS", None, "ocorrências", "contador_acumulado"),
+        "descartados_recebidos": ("NET_RX_DROPPED", None, "pacotes", "contador_acumulado"),
+        "descartados_enviados": ("NET_TX_DROPPED", None, "pacotes", "contador_acumulado")
+    },
+    "disco": {
+        "leitura_acumulada": ("DISCO_LEITURA_BYTES", None, "bytes", "contador_acumulado"),
+        "escrita_acumulada": ("DISCO_ESCRITA_BYTES", None, "bytes", "contador_acumulado"),
+        "camada_gravavel": ("CAMADA_GRAVAVEL_BYTES", None, "bytes", "medicao"),
+        "imagem": ("IMAGEM_SIZE_BYTES", None, "bytes", "inventario")
+    },
+    "reinicios": {
+        "total": ("RESTART_COUNT", None, "ocorrências", "contador_acumulado")
+    },
+    "pids": {
+        "atuais": ("PIDS_CURRENT", None, "processos", "medicao")
+    }
+}
 
 def organizar_campos(registro, campos, usados, prefixo='', percentual_limitado=True):
     # O mapa diz qual coluna ler e qual nome de métrica entregar pro Java buscar no banco.
@@ -432,15 +470,64 @@ def organizar_processo(registro):
 
 # Mantemos as leituras do container no seu próprio escopo. Não inferimos saúde da aplicação.
 def organizar_container(registro):
-    usados = {'TIMESTAMP', 'ENDERECO_MAC', 'CONTAINER'}
-    resultado = {'timestamp': registro['TIMESTAMP'], 'nome': registro['CONTAINER'], 'escopo': 'container'}
-    for grupo, campos in CAMPOS_CONTAINER.items():
-        medidas = organizar_campos(registro, campos, usados, percentual_limitado=False)
+
+    # O novo coletor Docker fornece CONTAINER_ID.
+    # Isso nos permite distinguir o formato novo do anterior.
+    novo_docker = "CONTAINER_ID" in registro
+
+    usados = {"TIMESTAMP", "ENDERECO_MAC", "CONTAINER"}
+
+    resultado = {
+        "timestamp": registro["TIMESTAMP"],
+        "nome": registro["CONTAINER"],
+        "escopo": "container"
+    }
+
+    if novo_docker:
+
+        # Preserva a identidade única do contêiner.
+        resultado["container_id"] = registro["CONTAINER_ID"]
+        usados.add("CONTAINER_ID")
+
+        # Informações de identificação e estado não são
+        # medidas numéricas e não devem receber médias.
+        resultado.update(
+            metadata(registro, {
+                "IMAGEM": "imagem",
+                "STATUS": "status",
+                "HEALTH_STATUS": "health_status",
+                "STARTED_AT": "started_at",
+                "FINISHED_AT": "finished_at",
+                "EXIT_CODE": "exit_code",
+                "OOM_KILLED": "oom_killed"
+            }, usados)
+        )
+
+    # Mantém compatibilidade com o formato anterior.
+    if novo_docker:
+        campos_container = CAMPOS_CONTAINER_DOCKER
+    else:
+        campos_container = CAMPOS_CONTAINER
+
+    # Organiza cada grupo utilizando a função já existente.
+    for grupo, campos in campos_container.items():
+
+        medidas = organizar_campos(
+            registro,
+            campos,
+            usados,
+            percentual_limitado=False
+        )
+
         if medidas:
             resultado[grupo] = medidas
+
+    # Preserva qualquer campo ainda não mapeado.
     restantes = extras(registro, usados)
+
     if restantes:
-        resultado['extras'] = restantes
+        resultado["extras"] = restantes
+
     return resultado
 
 
