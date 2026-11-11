@@ -585,16 +585,25 @@ def resumir_leituras(leituras):
 # Junta observações do mesmo recurso nos resumos, sem depender da posição dele na lista.
 # O coletor não fornece criação do processo/ID do container, então não identificamos toda reinicialização.
 def identidade_recurso(item):
+
+    # O ID identifica a instância real do contêiner.
+    # Nomes podem ser reutilizados após uma recriação.
+    if 'container_id' in item:
+        return ('container', item['container_id'])
+
     if 'pid' in item:
         return ('processo', item['pid'], item.get('nome'), item.get('usuario'))
+
     if 'montagem' in item:
         return ('volume', item['montagem'], item.get('dispositivo'), item.get('tipo_sistema'))
+
     if 'dispositivo' in item:
         return ('io', item['dispositivo'])
+
     if 'nome' in item:
         return ('nome', item['nome'])
-    return ('indice', item['indice'])
 
+    return ('indice', item['indice'])
 
 def resumir_estrutura(observacoes):
     # Percorre o conteúdo até chegar numa medida com valor/status.
