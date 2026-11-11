@@ -159,18 +159,39 @@ def transformar_dados(df, tipo_arquivo):
             f"Colunas obrigatorias ausentes: {faltantes}"
         )
 
-    df = df.replace(r"^\s*$", pd.NA, regex=True)
+    # Identifica as colunas que podem passar pela limpeza.
+    # A mensagem de log deve manter sua formatação original.
+    colunas_limpeza = [
+        coluna
+        for coluna in df.columns
+        if not (
+            tipo_arquivo == "docker_logs"
+            and coluna == "LOG_MENSAGEM"
+        )
+    ]
+
+    df[colunas_limpeza] = df[colunas_limpeza].replace(
+        r"^\s*$",
+        pd.NA,
+        regex=True
+    )
+
     df = df.dropna(how="all")
 
     for coluna in df.select_dtypes(
         include=["object", "string"]
     ).columns:
 
-        df[coluna] = (
-            df[coluna]
-            .astype("string")
-            .str.strip()
-        )
+        # Converte para string mantendo um tipo consistente.
+        df[coluna] = df[coluna].astype("string")
+
+        # Não remove espaços das mensagens de logs,
+        # pois a indentação pode ter significado.
+        if tipo_arquivo == "docker_logs" and coluna == "LOG_MENSAGEM":
+            continue
+
+        # Mantém a limpeza original nas demais colunas.
+        df[coluna] = df[coluna].str.strip()
 
         df[coluna] = df[coluna].replace("", pd.NA)
 
