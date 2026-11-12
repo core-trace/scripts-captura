@@ -1,7 +1,26 @@
 """Junta os resumos aos poucos, sem guardar todas as capturas do dia na memória."""
+import pandas as pd
+
 from copy import deepcopy
 from formato_gold import identidade_recurso
 
+def instante_comparavel(instante):
+
+    # Converte o texto em um Timestamp do Pandas.
+    # Isso também preserva a precisão de nanossegundos.
+    horario = pd.Timestamp(instante)
+
+    if pd.isna(horario):
+        raise ValueError("Timestamp invalido")
+
+    # Capturas tradicionais usam o horário local de São Paulo.
+    # Capturas Docker já possuem o fuso UTC informado.
+    if horario.tzinfo is None:
+        horario = horario.tz_localize("America/Sao_Paulo")
+
+    # Converte para UTC e retorna o valor em nanossegundos.
+    # Assim todos os horários podem ser comparados igualmente.
+    return horario.tz_convert("UTC").value
 
 # Aqui juntamos o que já foi calculado com as novas amostras que chegaram
 # A cópia evita mudar o resumo anterior enquanto ainda estamos usando ele na conta
@@ -85,7 +104,11 @@ def atualizar(estrutura, valor, instante, nome=''):
     if estrutura is None:
         estrutura = {'instante': instante}
 
-    mais_recente = instante >= estrutura['instante']
+    # Compara os instantes reais, independentemente do fuso.
+    mais_recente = (
+        instante_comparavel(instante)
+        >= instante_comparavel(estrutura["instante"])
+    )
 
     if isinstance(valor, dict):
         if 'amostras_validas' in valor:
@@ -134,7 +157,11 @@ def atualizar(estrutura, valor, instante, nome=''):
                 if horario is not None:
                     horarios.append(horario)
             if horarios:
-                estrutura['valor'] = min(horarios)
+                # Seleciona o instante mais antigo, não a menor string.
+                estrutura['valor'] = min(
+                    horarios,
+                    key=instante_comparavel
+                )
             else:
                 estrutura['valor'] = None
         elif nome in ('fim', 'ultima_observacao'):
@@ -143,7 +170,11 @@ def atualizar(estrutura, valor, instante, nome=''):
                 if horario is not None:
                     horarios.append(horario)
             if horarios:
-                estrutura['valor'] = max(horarios)
+                # Seleciona o instante mais recente.
+                estrutura['valor'] = max(
+                    horarios,
+                    key=instante_comparavel
+                )
             else:
                 estrutura['valor'] = None
         elif nome == 'amostras_observadas':
@@ -151,7 +182,12 @@ def atualizar(estrutura, valor, instante, nome=''):
         elif mais_recente or 'valor' not in estrutura:
             estrutura['valor'] = valor
 
-    estrutura['instante'] = max(estrutura['instante'], instante)
+    # Mantém o instante mais recente para as próximas agregações.
+    estrutura["instante"] = max(
+        estrutura["instante"],
+        instante,
+        key=instante_comparavel
+    )
     return estrutura
 
 

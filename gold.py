@@ -13,12 +13,22 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
 from resumos_gold import AcumuladorResumo
-from formato_gold import (organizar_metricas, organizar_processo, organizar_container,
-                          resumir_documento)
+from formato_gold import (
+    organizar_metricas,
+    organizar_processo,
+    organizar_container,
+    organizar_evento,
+    organizar_log,
+    resumir_documento
+)
 
 BUCKET = "bucket-coretrace"
 SILVER = "trusted/"
 GOLD = "client/"
+
+# Fuso utilizado para agrupar as capturas por dia.
+# Os timestamps Docker continuam preservados em UTC.
+FUSO_DIA = "America/Sao_Paulo"
 
 s3 = boto3.client("s3")
 
@@ -36,8 +46,14 @@ def preparar_gold(df, tipo_arquivo):
 
     if tipo_arquivo == "processos":
         obrigatorias.extend(["PID", "NOME"])
-    elif tipo_arquivo == "docker":
-        obrigatorias.append("CONTAINER")
+
+    elif tipo_arquivo in (
+        "docker_metricas",
+        "docker_eventos",
+        "docker_logs"
+    ):
+        # O ID identifica o contêiner mesmo quando seu nome muda.
+        obrigatorias.extend(["CONTAINER_ID", "CONTAINER"])
 
     faltantes = []
     for coluna in obrigatorias:
@@ -49,12 +65,25 @@ def preparar_gold(df, tipo_arquivo):
             f"Colunas obrigatorias ausentes: {faltantes}"
         )
 
-    # Uma data inválida interrompe em vez de apagar a linha
-    df["TIMESTAMP"] = pd.to_datetime(
-        df["TIMESTAMP"],
-        errors="raise",
-        format="ISO8601"
-    )
+    if tipo_arquivo.startswith("docker_"):
+
+        # O Docker registra timestamps com informações de fuso.
+        # Padronizamos todos os horários em UTC.
+        df["TIMESTAMP"] = pd.to_datetime(
+            df["TIMESTAMP"],
+            errors="raise",
+            format="ISO8601",
+            utc=True
+        )
+
+    else:
+
+        # Mantém o tratamento original dos arquivos antigos.
+        df["TIMESTAMP"] = pd.to_datetime(
+            df["TIMESTAMP"],
+            errors="raise",
+            format="ISO8601"
+        )
 
     # O mesmo MAC com hífen ou dois pontos vai pra mesma pasta
     df["ENDERECO_MAC"] = (
@@ -87,11 +116,27 @@ def preparar_gold(df, tipo_arquivo):
             raise ValueError("PID ou nome do processo invalido")
         df["PID"] = pids.astype("Int64")
         
-    elif tipo_arquivo == "docker" and df["CONTAINER"].astype("string").str.strip().eq("").any():
-        raise ValueError("Nome do container vazio")
+    elif tipo_arquivo.startswith("docker_"):
 
-    if df["TIMESTAMP"].dt.tz is not None:
-        raise ValueError("As capturas atuais devem usar horario local sem fuso")
+        # O contêiner precisa de ID e nome para ser identificado.
+        # Também impedimos identificadores compostos apenas por espaços.
+        for coluna in ("CONTAINER_ID", "CONTAINER"):
+
+            valores = df[coluna].astype("string").str.strip()
+
+            if valores.isna().any() or valores.eq("").any():
+                raise ValueError(
+                    f"Identificacao do container invalida: {coluna}"
+                )
+
+    # As capturas tradicionais continuam utilizando horário local sem fuso.
+    # Os arquivos Docker já foram normalizados para UTC.
+    if not tipo_arquivo.startswith("docker_"):
+
+        if df["TIMESTAMP"].dt.tz is not None:
+            raise ValueError(
+                "As capturas atuais devem usar horario local sem fuso"
+            )
 
     df = df.sort_values(
         ["ENDERECO_MAC", "TIMESTAMP"]
@@ -104,11 +149,20 @@ def preparar_gold(df, tipo_arquivo):
 
 # Função pra converter csv para json
 
-def converter_registros(df):
+def converter_registros(df, tipo_arquivo):
 
     # O drop pra tirar a coluna de data pq hoje em dia usamos a data como parêmetro só pra agrupar os dados
     # Ignorar erros pq se algum arquivo vier sem essa coluna ele só ignora isso sem dar erro que trave tudo
-    df = df.drop(columns=["DATA"], errors="ignore")
+    df = df.drop(columns=["DATA"], errors="ignore").copy()
+
+    # Os timestamps Docker podem possuir nanossegundos.
+    # Convertendo para string antes do JSON, evitamos
+    # a perda de precisão causada pelo to_json().
+    if tipo_arquivo.startswith("docker_"):
+
+        df["TIMESTAMP"] = df["TIMESTAMP"].map(
+            lambda instante: instante.isoformat().replace("+00:00", "Z")
+        )
 
     # Lê o texto json e transforma numa estrutura de lista com dicionários que o python entende
     return json.loads(
@@ -152,24 +206,87 @@ def ler_arquivo(chave, tipo_arquivo):
 
     # Esses campos são texto mesmo quando parecem números, como um boot ID com zeros na frente
     colunas_texto = {
-        "ENDERECO_MAC": "string", "NOME": "string", "USUARIO": "string",
-        "CONTAINER": "string", "RAM_OOM_BOOT_ID": "string", "CPU_SCHEMA_VERSION": "string"
+        "ENDERECO_MAC": "string",
+        "NOME": "string",
+        "USUARIO": "string",
+        "CONTAINER": "string",
+        "RAM_OOM_BOOT_ID": "string",
+        "CPU_SCHEMA_VERSION": "string",
+
+        # Identificação e informações do contêiner
+        "CONTAINER_ID": "string",
+        "IMAGEM": "string",
+        "STATUS": "string",
+        "HEALTH_STATUS": "string",
+        "OOM_KILLED": "string",
+        "STARTED_AT": "string",
+        "FINISHED_AT": "string",
+
+        # Eventos
+        "EVENT_ID": "string",
+        "EVENT_TYPE": "string",
+        "EVENT_ACTION": "string",
+        "EVENT_DETAILS": "string",
+
+        # Logs
+        "LOG_LEVEL": "string",
+        "LOG_MENSAGEM": "string"
     }
     
     df = pd.read_csv(
         io.StringIO(texto), header=0, names=colunas, low_memory=False,
         keep_default_na=False, na_values=[""], dtype=colunas_texto
     )
-    
-    # NA e NULL podem ser nomes de verdade. Só o campo vazio é tratado como ausência
 
-    tem_campos_processo = "PID" in df.columns or "NOME" in df.columns
-    if "CONTAINER" in df.columns:
-        if tem_campos_processo or tipo_arquivo != "processos":
-            raise ValueError("Esquema de container incompativel com a origem")
-        tipo_arquivo = "docker"
-    elif tipo_arquivo == "metricas" and tem_campos_processo:
-        raise ValueError("Processos recebidos na pasta de metricas")
+    # Colunas obrigatórias para cada tipo de arquivo Docker.
+    # Isso evita processar um CSV na categoria errada.
+    esquemas_docker = {
+        "docker_metricas": {
+            "CONTAINER_ID",
+            "CONTAINER",
+            "CPU_PERCENT",
+            "RAM_PERCENT"
+        },
+        "docker_eventos": {
+            "CONTAINER_ID",
+            "CONTAINER",
+            "EVENT_ID",
+            "EVENT_TYPE",
+            "EVENT_ACTION"
+        },
+        "docker_logs": {
+            "CONTAINER_ID",
+            "CONTAINER",
+            "LOG_MENSAGEM"
+        }
+    }
+    
+    if tipo_arquivo in esquemas_docker:
+
+        obrigatorias = esquemas_docker[tipo_arquivo]
+
+        faltantes = obrigatorias - set(df.columns)
+
+        if faltantes:
+            raise ValueError(
+                f"Colunas Docker ausentes: {sorted(faltantes)}"
+            )
+
+    elif tipo_arquivo == "processos":
+
+        if not {"PID", "NOME"}.issubset(df.columns):
+            raise ValueError("Esquema de processos invalido")
+
+        if "CONTAINER" in df.columns:
+            raise ValueError("Container recebido na pasta de processos")
+
+    elif tipo_arquivo == "metricas":
+
+        if {"PID", "NOME", "CONTAINER"} & set(df.columns):
+            raise ValueError("Esquema incompativel com metricas")
+
+    else:
+        raise ValueError(f"Tipo de arquivo desconhecido: {tipo_arquivo}")
 
     # Esse hash identifica o conteúdo de origem
     hash_origem = hashlib.sha256(conteudo).hexdigest()
@@ -178,8 +295,16 @@ def ler_arquivo(chave, tipo_arquivo):
 
 
 def novo_documento(mac, data):
-    return {"schema_version": 1, "endereco_mac": mac, "data": data,
-            "metricas": [], "processos": [], "containers": []}
+    return {
+        "schema_version": 1,
+        "endereco_mac": mac,
+        "data": data,
+        "metricas": [],
+        "processos": [],
+        "containers": [],
+        "eventos": [],
+        "logs": []
+    }
 
 
 def normalizar_id(valor):
@@ -199,23 +324,58 @@ def normalizar_id(valor):
         return int(valor)
     return valor
 
-
 def identificar_registros(documento):
-    # O ID serve pro Java ver uma observação já vista, mesmo em outro lote
-    # Usar só o horário não resolve, pq duas leituras diferentes podem ter o mesmo horário
-    for categoria in ("metricas", "processos", "containers"):
+
+    for categoria in (
+        "metricas",
+        "processos",
+        "containers",
+        "eventos",
+        "logs"
+    ):
+
+        # Conta quantas vezes o mesmo log apareceu no lote.
+        # Evita atribuir o mesmo ID a duas ocorrências iguais.
+        repeticoes_logs = {}
+
         for registro in documento[categoria]:
+
+            # Evita incluir um ID previamente calculado no hash.
+            registro_original = {
+                chave: valor
+                for chave, valor in registro.items()
+                if chave != "id_captura"
+            }
+
             identificacao = {
                 "mac": documento["endereco_mac"],
                 "categoria": categoria,
-                "registro": registro
+                "registro": registro_original
             }
-            texto = json.dumps(
-                normalizar_id(identificacao), sort_keys=True, ensure_ascii=False,
-                allow_nan=False, separators=(",", ":")
-            )
-            registro["id_captura"] = hashlib.sha256(texto.encode("utf-8")).hexdigest()
 
+            texto = json.dumps(
+                normalizar_id(identificacao),
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":")
+            )
+
+            if categoria == "logs":
+
+                # Dois logs completamente iguais dentro do lote
+                # recebem números de ocorrência diferentes.
+                ordem = repeticoes_logs.get(texto, 0)
+
+                repeticoes_logs[texto] = ordem + 1
+
+                # A ordem diferencia ocorrências iguais,
+                # sem precisar alterar a mensagem original.
+                texto = f"{texto}|ocorrencia={ordem}"
+
+            registro["id_captura"] = hashlib.sha256(
+                texto.encode("utf-8")
+            ).hexdigest()
 
 def arquivo_existe(chave):
     # Só consultamos se existe, sem baixar o JSON inteiro de novo
@@ -239,17 +399,38 @@ def montar_lote(grupo, mac, data, tipo, chave, hash_origem):
     if tipo == "metricas":
         campo = "metricas"
         organizar = organizar_metricas
+
     elif tipo == "processos":
         campo = "processos"
         organizar = organizar_processo
-    else:
+
+    elif tipo == "docker_metricas":
         campo = "containers"
         organizar = organizar_container
 
+    elif tipo == "docker_eventos":
+        campo = "eventos"
+        organizar = organizar_evento
+
+    elif tipo == "docker_logs":
+        campo = "logs"
+        organizar = organizar_log
+
+    else:
+        raise ValueError(f"Tipo de arquivo desconhecido: {tipo}")
+
     # Só removemos linhas inteiramente iguais
-    grupo = grupo.drop_duplicates().sort_values("TIMESTAMP", kind="stable")
+    # Ordena os registros pelo horário original.
+    grupo = grupo.sort_values("TIMESTAMP", kind="stable")
+
+    # Logs e eventos representam ocorrências individuais.
+    # Evitamos remover registros apenas por terem conteúdo igual.
+    if tipo not in ("docker_eventos", "docker_logs"):
+        grupo = grupo.drop_duplicates()
     
-    for registro in converter_registros(grupo):
+    # Informa o tipo para que o conversor saiba
+    # quando deve preservar os nanossegundos.
+    for registro in converter_registros(grupo, tipo):
         lote[campo].append(organizar(registro))
 
     identificar_registros(lote)
@@ -297,13 +478,40 @@ def processar_gold():
                         tipo = "metricas"
                     elif chave.startswith(SILVER + "processos/"):
                         tipo = "processos"
+
+                    # Identifica os três tipos de arquivos Docker.
+                    # Cada um terá seu próprio tratamento no formato_gold.
+                    elif chave.startswith(SILVER + "docker/metricas/"):
+                        tipo = "docker_metricas"
+
+                    elif chave.startswith(SILVER + "docker/eventos/"):
+                        tipo = "docker_eventos"
+
+                    elif chave.startswith(SILVER + "docker/logs/"):
+                        tipo = "docker_logs"
+
                     else:
                         print("Arquivo ignorado:", chave)
                         continue
 
                     try:
                         df, tipo, hash_origem = ler_arquivo(chave, tipo)
-                        df["DATA"] = df["TIMESTAMP"].dt.strftime("%Y-%m-%d")
+                        
+                        if tipo.startswith("docker_"):
+
+                            # Converte o horário UTC para o fuso utilizado
+                            # no agrupamento diário do CoreTrace.
+                            # Não altera o TIMESTAMP original.
+                            df["DATA"] = (
+                                df["TIMESTAMP"]
+                                .dt.tz_convert(FUSO_DIA)
+                                .dt.strftime("%Y-%m-%d")
+                            )
+
+                        else:
+
+                            # As capturas tradicionais já utilizam horário local.
+                            df["DATA"] = df["TIMESTAMP"].dt.strftime("%Y-%m-%d")
 
                         # Até um CSV que cruza meia noite é separado na máquina e no dia corretos
                         for (mac, data), grupo in df.groupby(["ENDERECO_MAC", "DATA"]):
