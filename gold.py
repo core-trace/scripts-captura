@@ -13,8 +13,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
 from resumos_gold import AcumuladorResumo
-from formato_gold import (organizar_metricas, organizar_processo, organizar_container,
-                          resumir_documento)
+from formato_gold import (
+    organizar_metricas,
+    organizar_processo,
+    organizar_container,
+    organizar_evento,
+    organizar_log,
+    resumir_documento
+)
 
 BUCKET = "bucket-coretrace"
 SILVER = "trusted/"
@@ -276,8 +282,16 @@ def ler_arquivo(chave, tipo_arquivo):
 
 
 def novo_documento(mac, data):
-    return {"schema_version": 1, "endereco_mac": mac, "data": data,
-            "metricas": [], "processos": [], "containers": []}
+    return {
+        "schema_version": 1,
+        "endereco_mac": mac,
+        "data": data,
+        "metricas": [],
+        "processos": [],
+        "containers": [],
+        "eventos": [],
+        "logs": []
+    }
 
 
 def normalizar_id(valor):
@@ -301,7 +315,13 @@ def normalizar_id(valor):
 def identificar_registros(documento):
     # O ID serve pro Java ver uma observação já vista, mesmo em outro lote
     # Usar só o horário não resolve, pq duas leituras diferentes podem ter o mesmo horário
-    for categoria in ("metricas", "processos", "containers"):
+    for categoria in (
+        "metricas",
+        "processos",
+        "containers",
+        "eventos",
+        "logs"
+    ):
         for registro in documento[categoria]:
             identificacao = {
                 "mac": documento["endereco_mac"],
@@ -337,15 +357,34 @@ def montar_lote(grupo, mac, data, tipo, chave, hash_origem):
     if tipo == "metricas":
         campo = "metricas"
         organizar = organizar_metricas
+
     elif tipo == "processos":
         campo = "processos"
         organizar = organizar_processo
-    else:
+
+    elif tipo == "docker_metricas":
         campo = "containers"
         organizar = organizar_container
 
+    elif tipo == "docker_eventos":
+        campo = "eventos"
+        organizar = organizar_evento
+
+    elif tipo == "docker_logs":
+        campo = "logs"
+        organizar = organizar_log
+
+    else:
+        raise ValueError(f"Tipo de arquivo desconhecido: {tipo}")
+
     # Só removemos linhas inteiramente iguais
-    grupo = grupo.drop_duplicates().sort_values("TIMESTAMP", kind="stable")
+    # Ordena os registros pelo horário original.
+    grupo = grupo.sort_values("TIMESTAMP", kind="stable")
+
+    # Logs e eventos representam ocorrências individuais.
+    # Evitamos remover registros apenas por terem conteúdo igual.
+    if tipo not in ("docker_eventos", "docker_logs"):
+        grupo = grupo.drop_duplicates()
     
     for registro in converter_registros(grupo):
         lote[campo].append(organizar(registro))

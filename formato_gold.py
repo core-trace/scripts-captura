@@ -530,6 +530,33 @@ def organizar_container(registro):
 
     return resultado
 
+def organizar_evento(registro):
+
+    # Eventos são acontecimentos individuais.
+    # Não calculamos médias nem transformamos ações em métricas.
+    return {
+        "timestamp": registro["TIMESTAMP"],
+        "container_id": registro["CONTAINER_ID"],
+        "nome": registro["CONTAINER"],
+        "event_id": registro["EVENT_ID"],
+        "tipo": registro["EVENT_TYPE"],
+        "acao": registro["EVENT_ACTION"],
+        "detalhes": registro.get("EVENT_DETAILS"),
+        "exit_code": registro.get("EXIT_CODE")
+    }
+
+
+def organizar_log(registro):
+
+    # Preserva o conteúdo da mensagem para consultas históricas.
+    # O nível informado pelo coletor não é alterado.
+    return {
+        "timestamp": registro["TIMESTAMP"],
+        "container_id": registro["CONTAINER_ID"],
+        "nome": registro["CONTAINER"],
+        "nivel": registro.get("LOG_LEVEL"),
+        "mensagem": registro["LOG_MENSAGEM"]
+    }
 
 def resumir_leituras(leituras):
     # Só leituras ok entram nas contas. Um zero válido participa; um null não participa.
@@ -581,6 +608,71 @@ def resumir_leituras(leituras):
             resumo[direcao] = resumir_leituras(partes)
     return resumo
 
+def medida_contagem(quantidade, unidade):
+
+    # Utilizamos eventos_intervalo porque o acumulador
+    # já sabe somar ocorrências entre diferentes lotes.
+    return {
+        "metrica": None,
+        "unidade": unidade,
+        "tipo": "eventos_intervalo",
+        "amostras_validas": quantidade,
+        "amostras_invalidas": 0,
+        "total_observado": quantidade
+    }
+
+
+def resumir_ocorrencias(registros, campo, agrupamento, unidade):
+
+    containers = {}
+
+    for registro in registros:
+
+        identificador = registro["container_id"]
+
+        # Cada instância do contêiner possui sua própria contagem.
+        if identificador not in containers:
+            containers[identificador] = {
+                "container_id": identificador,
+                "nome": registro["nome"],
+                "_total": 0,
+                "_contagens": {}
+            }
+
+        grupo = containers[identificador]
+        grupo["nome"] = registro["nome"]
+
+        grupo["_total"] += 1
+
+        # Identifica a ação do evento ou o nível do log.
+        categoria = (
+            str(registro.get(campo) or "nao_informado")
+            .strip()
+            .lower()
+            or "nao_informado"
+        )
+
+        contagens = grupo["_contagens"]
+
+        contagens[categoria] = contagens.get(categoria, 0) + 1
+
+    resultado = []
+
+    for grupo in containers.values():
+
+        # Converte as contagens para o formato que o
+        # AcumuladorResumo já consegue combinar.
+        resultado.append({
+            "container_id": grupo["container_id"],
+            "nome": grupo["nome"],
+            "total": medida_contagem(grupo["_total"], unidade),
+            agrupamento: {
+                nome: medida_contagem(quantidade, unidade)
+                for nome, quantidade in grupo["_contagens"].items()
+            }
+        })
+
+    return resultado
 
 # Junta observações do mesmo recurso nos resumos, sem depender da posição dele na lista.
 # O coletor não fornece criação do processo/ID do container, então não identificamos toda reinicialização.
@@ -662,8 +754,14 @@ def resumir_cpu(capturas):
 
 
 def resumir_documento(documento):
-    # O resumo cobre só o intervalo observado, não uma garantia de coleta do dia inteiro.
-    registros = documento['metricas'] + documento['processos'] + documento['containers']
+    # Incluímos eventos e logs no período observado pelo documento.
+    registros = (
+        documento["metricas"]
+        + documento["processos"]
+        + documento["containers"]
+        + documento.get("eventos", [])
+        + documento.get("logs", [])
+    )
     horarios = []
     for registro in registros:
         horarios.append(registro['timestamp'])
@@ -681,4 +779,21 @@ def resumir_documento(documento):
             resultado[categoria] = resumir_estrutura([documento[categoria]])
         else:
             resultado[categoria] = []
+
+    # Agrupa os eventos por contêiner e ação.
+    resultado["eventos"] = resumir_ocorrencias(
+        documento.get("eventos", []),
+        campo="acao",
+        agrupamento="acoes",
+        unidade="ocorrências"
+    )
+
+    # Agrupa os logs por contêiner e nível.
+    resultado["logs"] = resumir_ocorrencias(
+        documento.get("logs", []),
+        campo="nivel",
+        agrupamento="niveis",
+        unidade="mensagens"
+    )
+    
     return resultado
