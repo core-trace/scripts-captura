@@ -26,6 +26,10 @@ BUCKET = "bucket-coretrace"
 SILVER = "trusted/"
 GOLD = "client/"
 
+# Fuso utilizado para agrupar as capturas por dia.
+# Os timestamps Docker continuam preservados em UTC.
+FUSO_DIA = "America/Sao_Paulo"
+
 s3 = boto3.client("s3")
 
 
@@ -145,11 +149,20 @@ def preparar_gold(df, tipo_arquivo):
 
 # Função pra converter csv para json
 
-def converter_registros(df):
+def converter_registros(df, tipo_arquivo):
 
     # O drop pra tirar a coluna de data pq hoje em dia usamos a data como parêmetro só pra agrupar os dados
     # Ignorar erros pq se algum arquivo vier sem essa coluna ele só ignora isso sem dar erro que trave tudo
-    df = df.drop(columns=["DATA"], errors="ignore")
+    df = df.drop(columns=["DATA"], errors="ignore").copy()
+
+    # Os timestamps Docker podem possuir nanossegundos.
+    # Convertendo para string antes do JSON, evitamos
+    # a perda de precisão causada pelo to_json().
+    if tipo_arquivo.startswith("docker_"):
+
+        df["TIMESTAMP"] = df["TIMESTAMP"].map(
+            lambda instante: instante.isoformat().replace("+00:00", "Z")
+        )
 
     # Lê o texto json e transforma numa estrutura de lista com dicionários que o python entende
     return json.loads(
@@ -311,10 +324,8 @@ def normalizar_id(valor):
         return int(valor)
     return valor
 
-
 def identificar_registros(documento):
-    # O ID serve pro Java ver uma observação já vista, mesmo em outro lote
-    # Usar só o horário não resolve, pq duas leituras diferentes podem ter o mesmo horário
+
     for categoria in (
         "metricas",
         "processos",
@@ -322,18 +333,49 @@ def identificar_registros(documento):
         "eventos",
         "logs"
     ):
+
+        # Conta quantas vezes o mesmo log apareceu no lote.
+        # Evita atribuir o mesmo ID a duas ocorrências iguais.
+        repeticoes_logs = {}
+
         for registro in documento[categoria]:
+
+            # Evita incluir um ID previamente calculado no hash.
+            registro_original = {
+                chave: valor
+                for chave, valor in registro.items()
+                if chave != "id_captura"
+            }
+
             identificacao = {
                 "mac": documento["endereco_mac"],
                 "categoria": categoria,
-                "registro": registro
+                "registro": registro_original
             }
-            texto = json.dumps(
-                normalizar_id(identificacao), sort_keys=True, ensure_ascii=False,
-                allow_nan=False, separators=(",", ":")
-            )
-            registro["id_captura"] = hashlib.sha256(texto.encode("utf-8")).hexdigest()
 
+            texto = json.dumps(
+                normalizar_id(identificacao),
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":")
+            )
+
+            if categoria == "logs":
+
+                # Dois logs completamente iguais dentro do lote
+                # recebem números de ocorrência diferentes.
+                ordem = repeticoes_logs.get(texto, 0)
+
+                repeticoes_logs[texto] = ordem + 1
+
+                # A ordem diferencia ocorrências iguais,
+                # sem precisar alterar a mensagem original.
+                texto = f"{texto}|ocorrencia={ordem}"
+
+            registro["id_captura"] = hashlib.sha256(
+                texto.encode("utf-8")
+            ).hexdigest()
 
 def arquivo_existe(chave):
     # Só consultamos se existe, sem baixar o JSON inteiro de novo
@@ -386,7 +428,9 @@ def montar_lote(grupo, mac, data, tipo, chave, hash_origem):
     if tipo not in ("docker_eventos", "docker_logs"):
         grupo = grupo.drop_duplicates()
     
-    for registro in converter_registros(grupo):
+    # Informa o tipo para que o conversor saiba
+    # quando deve preservar os nanossegundos.
+    for registro in converter_registros(grupo, tipo):
         lote[campo].append(organizar(registro))
 
     identificar_registros(lote)
@@ -452,7 +496,22 @@ def processar_gold():
 
                     try:
                         df, tipo, hash_origem = ler_arquivo(chave, tipo)
-                        df["DATA"] = df["TIMESTAMP"].dt.strftime("%Y-%m-%d")
+                        
+                        if tipo.startswith("docker_"):
+
+                            # Converte o horário UTC para o fuso utilizado
+                            # no agrupamento diário do CoreTrace.
+                            # Não altera o TIMESTAMP original.
+                            df["DATA"] = (
+                                df["TIMESTAMP"]
+                                .dt.tz_convert(FUSO_DIA)
+                                .dt.strftime("%Y-%m-%d")
+                            )
+
+                        else:
+
+                            # As capturas tradicionais já utilizam horário local.
+                            df["DATA"] = df["TIMESTAMP"].dt.strftime("%Y-%m-%d")
 
                         # Até um CSV que cruza meia noite é separado na máquina e no dia corretos
                         for (mac, data), grupo in df.groupby(["ENDERECO_MAC", "DATA"]):
