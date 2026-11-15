@@ -697,6 +697,25 @@ def identidade_recurso(item):
 
     return ('indice', item['indice'])
 
+
+# Uma "medida" é qualquer dicionário com metrica+tipo juntos: tanto uma leitura
+# crua (metrica/tipo/valor/status, antes do resumo) quanto um bloco já resumido
+# (metrica/tipo/media/minimo/maximo...). Os dois formatos usam essas duas chaves
+# juntas, então a mesma função percorre tanto o registro de uma captura quanto
+# o resumo diário já pronto, sem precisar saber qual dos dois é.
+# Serve pra "tempo no estado" (gold.py): uma vez pra ler os valores de cada
+# captura, outra pra encaixar o resultado calculado de volta no resumo.
+def para_cada_medida(estrutura, funcao):
+    if isinstance(estrutura, dict):
+        if 'metrica' in estrutura and 'tipo' in estrutura:
+            funcao(estrutura)
+        for valor in estrutura.values():
+            para_cada_medida(valor, funcao)
+    elif isinstance(estrutura, list):
+        for item in estrutura:
+            para_cada_medida(item, funcao)
+
+
 def resumir_estrutura(observacoes):
     # Percorre o conteúdo até chegar numa medida com valor/status.
     # Quando encontra uma lista, primeiro separa os recursos pra não misturar seus históricos.
