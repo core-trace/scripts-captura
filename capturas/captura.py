@@ -344,7 +344,9 @@ def capturar_dados(
     estado_cpu,
     estado_ram,
     estado_swap=None,
-    estado_carga=None
+    estado_carga=None,
+    token_instalacao=None,
+    token_perfil_servidor=None
 ):
     cache = {}
 
@@ -353,7 +355,12 @@ def capturar_dados(
             "%Y-%m-%d %H:%M:%S"
         ),
 
-        "ENDERECO_MAC": endereco_mac
+        "ENDERECO_MAC": endereco_mac,
+
+        # Vão em toda linha pra Gold conseguir buscar os limites desse
+        # servidor na API sem precisar de outra fonte além do próprio CSV.
+        "TOKEN_INSTALACAO": token_instalacao,
+        "TOKEN_PERFIL_SERVIDOR": token_perfil_servidor
     }
 
     for metrica in metricas:
@@ -455,7 +462,9 @@ def main():
 
     colunas = [
         "TIMESTAMP",
-        "ENDERECO_MAC"
+        "ENDERECO_MAC",
+        "TOKEN_INSTALACAO",
+        "TOKEN_PERFIL_SERVIDOR"
     ]
 
     colunas.extend(
@@ -497,7 +506,10 @@ def main():
 
     try:
         while True:
-            dados = capturar_dados(metricas, endereco_mac, estado_cpu, estado_ram, estado_swap, estado_carga)
+            dados = capturar_dados(
+                metricas, endereco_mac, estado_cpu, estado_ram, estado_swap, estado_carga,
+                token_instalacao, token_perfil_servidor
+            )
 
             dados.update(coletar_rede_geral(estado_rede))
             dados.update(coletar_disco_geral(estado_disco))
