@@ -2,7 +2,7 @@
 import pandas as pd
 
 from copy import deepcopy
-from formato_gold import identidade_recurso
+from formato_gold import identidade_recurso, para_cada_medida
 
 def instante_comparavel(instante):
 
@@ -358,3 +358,59 @@ class AcumuladorTempoNoEstado:
             if tempo is not None:
                 resultado[metrica] = tempo
         return resultado
+
+
+# Mesma ordem de gravidade do "pesos" usado em website/public/scripts/dashboardDados.js
+# (maior(a, b) do front), só que sem o nivel "sem-dados": a Gold nunca lida com ele,
+# nem como entrada (AcumuladorTempoNoEstado so compara leituras validas) nem como saida
+# (ver o comentario em calcular_severidade sobre por que esse nivel fica pra quem le o resumo).
+PESOS_SEVERIDADE = {"normal": 0, "atencao": 1, "critico": 2}
+
+
+def calcular_severidade(resumos):
+    """Resume num unico campo, pro servidor inteiro, qual foi a pior situacao do dia.
+
+    Parte 1 - a pior metrica manda: percorremos todas as leituras do resumo que
+    ganharam um tempo_no_estado (ou seja, tinham limite configurado no perfil - ver
+    AcumuladorTempoNoEstado.calcular) e pegamos o estado_atual mais grave entre elas.
+    Se NENHUMA leitura tiver tempo_no_estado - a API de limites pode ter caido nesse dia,
+    ou o perfil simplesmente nao configurou limite pra nenhuma metrica - nao inventamos
+    um valor "normal" por omissao: devolvemos None, e quem chamar essa funcao (gold.py)
+    deve OMITIR o campo "severidade" do resumo, do mesmo jeito que tempo_no_estado ja
+    fica ausente (e nao None) quando nao ha limite pra comparar.
+
+    Parte 2 - OOM e um criterio por fora da Parte 1: ram_oom_kills nao tem
+    limite_atencao/limite_critico em nenhum perfil do catalogo (database/script.sql),
+    entao ela nunca ganha tempo_no_estado - a Parte 1, sozinha, nunca saberia de um OOM.
+    Por isso, se o dia teve pelo menos um OOM kill (resumos.ram.oom.total_observado > 0),
+    forcamos severidade = "critico" por essa regra de negocio (um OOM e grave mesmo que
+    a ultima leitura de CPU/RAM esteja normal) - mesmo que a Parte 1 nao tenha achado
+    nada pra comparar. As duas partes sao independentes: uma nao precisa da outra ter
+    dado certo.
+
+    Por que nunca devolvemos "sem-dados": esse nivel so faz sentido comparando o
+    timestamp de uma leitura contra o "agora" de quem le o resumo depois (a regra dos
+    15 minutos de recencia, ja decidida no site) - e a Gold roda num momento diferente
+    de quando alguem vai olhar esse resumo. Calcular "sem-dados" aqui arriscaria ficar
+    velho antes mesmo de alguem ler. Isso espelha como catalog-api-03 fica "silenciosa"
+    sem nenhum campo dizendo "sem dados": quem le percebe pelo "fim" (timestamp da
+    ultima leitura) estar antigo.
+    """
+    pior = None
+
+    def _conferir_estado(leitura):
+        nonlocal pior
+        tempo = leitura.get('tempo_no_estado')
+        if tempo is None:
+            return
+        estado = tempo.get('estado_atual')
+        if pior is None or PESOS_SEVERIDADE.get(estado, -1) > PESOS_SEVERIDADE.get(pior, -1):
+            pior = estado
+
+    para_cada_medida(resumos, _conferir_estado)
+
+    oom = resumos.get('ram', {}).get('oom', {}).get('total_observado')
+    if isinstance(oom, (int, float)) and not isinstance(oom, bool) and oom > 0:
+        pior = 'critico'
+
+    return pior
