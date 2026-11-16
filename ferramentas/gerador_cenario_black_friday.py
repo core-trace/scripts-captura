@@ -40,6 +40,7 @@ FIM = datetime(2026, 11, 27, 20, 30)
 # (cpu, ram, swap, carga, disco, rede) ja e um CSV valido e realista.
 COLUNAS_METRICAS = [
     "TIMESTAMP", "ENDERECO_MAC",
+    "TOKEN_INSTALACAO", "TOKEN_PERFIL_SERVIDOR",
     "cpu_percent", "cpu_percent_status",
     "ram_percent", "ram_percent_status",
     "swap_percent", "swap_percent_status",
@@ -91,6 +92,16 @@ def estavel(base, amplitude):
 
     return calcular
 
+
+# Empresa iFood (database/script.sql) e os tokens de cada perfil de servidor.
+# Os 3 perfis tem o mesmo token de instalacao (mesma empresa), mas cada um
+# tem seu proprio token de perfil - e por isso seus proprios limites.
+TOKEN_INSTALACAO_IFOOD = "123"
+TOKENS_PERFIL = {
+    "Carrinho": "321",
+    "Financeiro": "322",
+    "Catálogo": "323",
+}
 
 # 10 servidores do cenario, com MAC e perfil conforme database/script.sql
 # (perfil_servidor 1=Carrinho, 2=Financeiro, 3=Catalogo).
@@ -194,6 +205,8 @@ def linha_metricas(servidor, horario, swap, carga15, disco):
     return {
         "TIMESTAMP": horario.strftime("%Y-%m-%d %H:%M:%S"),
         "ENDERECO_MAC": servidor["mac"],
+        "TOKEN_INSTALACAO": TOKEN_INSTALACAO_IFOOD,
+        "TOKEN_PERFIL_SERVIDOR": TOKENS_PERFIL[servidor["perfil"]],
         "cpu_percent": round(servidor["cpu"](horario), 2),
         "cpu_percent_status": "ok",
         "ram_percent": round(servidor["ram"](horario), 2),
