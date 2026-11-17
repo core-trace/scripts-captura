@@ -8,18 +8,21 @@ import csv
 import hashlib
 import sqlite3
 import math
+import requests
+from silver import processar_arquivos as processar_silver
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
     organizar_container,
     organizar_evento,
     organizar_log,
-    resumir_documento
+    resumir_documento,
+    para_cada_medida
 )
 
 BUCKET = "bucket-coretrace"
@@ -30,7 +33,56 @@ GOLD = "client/"
 # Os timestamps Docker continuam preservados em UTC.
 FUSO_DIA = "America/Sao_Paulo"
 
+# Mesma API e mesma convenção de URL que capturas/captura.py já usa.
+API_BASE_URL = "http://localhost:3333"
+
 s3 = boto3.client("s3")
+
+
+def buscar_limites_perfil(token_instalacao, token_perfil_servidor):
+    """Busca na API do site os limites de atenção/crítico do perfil desse servidor.
+
+    Essa chamada é opcional pro resultado da Gold: se o site não estiver no ar
+    (por exemplo, num teste local sem ele rodando), só avisamos e devolvemos None.
+    Quem chamar esta função deve tratar None como "sem tempo no estado pra esse
+    MAC", sem interromper o resto do processamento - médias, mínimos e máximos
+    não dependem dessa chamada.
+    """
+    try:
+        resposta = requests.get(
+            f"{API_BASE_URL}/empresa/metricas",
+            headers={
+                "Authorization": f"Bearer {token_instalacao}",
+                "token-perfil": token_perfil_servidor
+            },
+            timeout=5
+        )
+    except requests.RequestException as erro:
+        print(
+            f"Aviso: nao foi possivel consultar os limites em {API_BASE_URL} ({erro}). "
+            "O resumo sera gerado sem o campo de tempo no estado para esse servidor."
+        )
+        return None
+
+    if resposta.status_code != 200:
+        print(
+            f"Aviso: a API de metricas respondeu {resposta.status_code} ao buscar limites. "
+            "O resumo sera gerado sem o campo de tempo no estado para esse servidor."
+        )
+        return None
+
+    # Agrupamos pelo nome_coluna, que é a mesma chave usada no campo "metrica" das leituras.
+    limites_por_metrica = {}
+    for componente in resposta.json():
+        limites_por_metrica[componente["nome_coluna"]] = {
+            "operador": componente.get("operador"),
+            "limite_atencao": componente.get("limite_atencao"),
+            "limite_critico": componente.get("limite_critico"),
+            "operador_2": componente.get("operador_2"),
+            "limite_atencao_2": componente.get("limite_atencao_2"),
+            "limite_critico_2": componente.get("limite_critico_2"),
+        }
+    return limites_por_metrica
 
 
 def preparar_gold(df, tipo_arquivo):
@@ -212,6 +264,12 @@ def ler_arquivo(chave, tipo_arquivo):
         "CONTAINER": "string",
         "RAM_OOM_BOOT_ID": "string",
         "CPU_SCHEMA_VERSION": "string",
+
+        # Tokens: sem forçar texto, "123" sem outro valor na coluna viraria
+        # inteiro/float no pandas (ex.: 123.0) e deixaria de bater com o token
+        # (texto) cadastrado no banco do site.
+        "TOKEN_INSTALACAO": "string",
+        "TOKEN_PERFIL_SERVIDOR": "string",
 
         # Identificação e informações do contêiner
         "CONTAINER_ID": "string",
@@ -459,6 +517,8 @@ def processar_gold():
     print("Buscando lotes na Silver...")
     diarios = {}
     lotes_atuais = {}
+    tempos_no_estado = {}  # (mac, data) -> AcumuladorTempoNoEstado, em paralelo aos "diarios"
+    tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
 
     # O arquivo de IDs evita guardar milhões de identificadores na RAM
@@ -526,10 +586,20 @@ def processar_gold():
                             if chave_dia not in diarios:
                                 diarios[chave_dia] = AcumuladorResumo()
                                 lotes_atuais[chave_dia] = []
+                                tempos_no_estado[chave_dia] = AcumuladorTempoNoEstado()
                             acumulador = diarios[chave_dia]
+                            acumulador_tempo = tempos_no_estado[chave_dia]
                             lotes_atuais[chave_dia].append({
                                 "lote_id": lote_id, "chave": destino, "origem": lote["origem"]
                             })
+
+                            # Guarda os tokens dessa máquina pra consultar os limites na API
+                            # só uma vez, depois que todos os arquivos já foram lidos.
+                            if tipo == "metricas" and {"TOKEN_INSTALACAO", "TOKEN_PERFIL_SERVIDOR"} <= set(grupo.columns):
+                                token_instalacao = grupo["TOKEN_INSTALACAO"].iloc[0]
+                                token_perfil_servidor = grupo["TOKEN_PERFIL_SERVIDOR"].iloc[0]
+                                if pd.notna(token_instalacao) and pd.notna(token_perfil_servidor):
+                                    tokens_por_mac[mac] = (str(token_instalacao), str(token_perfil_servidor))
 
                             for registro in lote[campo]:
                                 # O ID é chave primária. Se já apareceu em outro arquivo, o SQLite ignora
@@ -543,15 +613,48 @@ def processar_gold():
                                     observacao[campo] = [registro]
                                     resumo = resumir_documento(observacao)
                                     acumulador.adicionar(resumo, registro["timestamp"])
+
+                                    # "Tempo no estado" precisa das leituras cruas, na ordem do
+                                    # tempo - por isso alimentamos um acumulador separado aqui,
+                                    # em vez de tentar extrair isso do resumo já combinado acima.
+                                    if campo == "metricas":
+                                        instante = registro["timestamp"]
+                                        para_cada_medida(
+                                            registro,
+                                            lambda leitura: acumulador_tempo.adicionar(
+                                                leitura.get("metrica"), instante,
+                                                leitura.get("valor"), leitura.get("status")
+                                            )
+                                        )
                     except Exception as erro:
                         raise ValueError(f"Falha em {chave}: {erro}") from erro
+
+            # Uma consulta de limites por token já serve pra todos os dias desse MAC.
+            cache_limites = {}
 
             # O resumo diário fica separado dos lotes que o Java usa para gerar alertas
             for (mac, data), acumulador in sorted(diarios.items()):
                 referencias = sorted(lotes_atuais[(mac, data)], key=chave_do_lote)
+                resumos = acumulador.resultado()
+
+                tokens = tokens_por_mac.get(mac)
+                if tokens is not None:
+                    if tokens not in cache_limites:
+                        cache_limites[tokens] = buscar_limites_perfil(*tokens)
+                    limites_por_metrica = cache_limites[tokens]
+
+                    if limites_por_metrica is not None:
+                        tempo_por_metrica = tempos_no_estado[(mac, data)].calcular(limites_por_metrica)
+                        if tempo_por_metrica:
+                            def _injetar_tempo_no_estado(leitura):
+                                tempo = tempo_por_metrica.get(leitura.get("metrica"))
+                                if tempo is not None:
+                                    leitura["tempo_no_estado"] = tempo
+                            para_cada_medida(resumos, _injetar_tempo_no_estado)
+
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",
-                    "endereco_mac": mac, "data": data, "resumos": acumulador.resultado(),
+                    "endereco_mac": mac, "data": data, "resumos": resumos,
                     "lotes_atuais": referencias
                 }
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
@@ -565,6 +668,17 @@ def processar_gold():
             print("Arquivo JSON enviado para:", destino)
     print("Processamento Gold finalizado!")
 
+def lambda_handler(event, context):
+    print("=== Etapa 1: Processando camada Silver (raw/ -> trusted/) ===")
+    processar_silver()
+
+    print("=== Etapa 2: Processando camada Gold (trusted/ -> client/) ===")
+    processar_gold()
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps("Pipeline Silver + Gold finalizado com sucesso!")
+    }
 
 if __name__ == "__main__":
 
@@ -582,3 +696,6 @@ if __name__ == "__main__":
 
         print("Aguardando 5 minutos...")
         time.sleep(300)
+
+
+    
