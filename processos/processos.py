@@ -8,12 +8,16 @@ COLUNAS_PROCESSOS = [
     "USUARIO",
     "CPU_PERCENT",
     "MEMORIA_PERCENT",
+    "CRIACAO_PROCESSO",
+    "THREADS",
+    "RSS",
+    "STATUS"
 ]
 
-ATRIBUTOS = ["pid", "name", "username", "cpu_percent", "memory_percent"]
+ATRIBUTOS = ["pid", "name", "username", "cpu_percent", "memory_percent","create_time","num_threads","status"]
 
 
-def coletar_processos(timestamp, endereco_mac, limite=20):
+def coletar_processos(timestamp, endereco_mac, limite=50):
     linhas = []
 
     # process_iter reaproveita os objetos entre as chamadas, então o cpu_percent
@@ -30,6 +34,10 @@ def coletar_processos(timestamp, endereco_mac, limite=20):
                 "USUARIO": info["username"],
                 "CPU_PERCENT": info["cpu_percent"],
                 "MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2),
+                "CRIACAO_PROCESSO": proc.info["create_time"],
+                "THREADS": proc.info["num_threads"],
+                "RSS": proc.memory.info().rss,
+                "STATUS": proc.info["status"]
             })
 
         except (psutil.NoSuchProcess, psutil.AccessDenied):
