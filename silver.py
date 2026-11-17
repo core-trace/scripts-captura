@@ -41,7 +41,10 @@ CAMPOS_TEXTO = {
 
     # Logs do Docker
     "log_level",
-    "log_mensagem"
+    "log_mensagem",
+
+    # Criação dos processos
+    "create_time"
 }
 
 

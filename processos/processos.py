@@ -8,9 +8,9 @@ COLUNAS_PROCESSOS = [
     "USUARIO",
     "CPU_PERCENT",
     "MEMORIA_PERCENT",
-    "CRIACAO_PROCESSO",
-    "THREADS",
-    "RSS",
+    "CREATE_TIME",
+    "NUM_THREADS",
+    "RSS_BYTES",
     "STATUS"
 ]
 
@@ -34,9 +34,9 @@ def coletar_processos(timestamp, endereco_mac, limite=50):
                 "USUARIO": info["username"],
                 "CPU_PERCENT": info["cpu_percent"],
                 "MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2),
-                "CRIACAO_PROCESSO": proc.info["create_time"],
-                "THREADS": proc.info["num_threads"],
-                "RSS": proc.memory.info().rss,
+                "CREATE_TIME": proc.info["create_time"],
+                "NUM_THREADS": proc.info["num_threads"],
+                "RSS_BYTES": proc.memory.info().rss,
                 "STATUS": proc.info["status"]
             })
 
