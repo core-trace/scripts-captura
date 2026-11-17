@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, calcular_severidade
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -652,20 +652,11 @@ def processar_gold():
                                     leitura["tempo_no_estado"] = tempo
                             para_cada_medida(resumos, _injetar_tempo_no_estado)
 
-                # A severidade usa o que acabamos de calcular acima (tempo_por_metrica
-                # ja injetado em "resumos"), mais a contagem de OOM que o resumo ja tinha
-                # antes disso - nao precisa de nenhuma chamada nova a API.
-                severidade = calcular_severidade(resumos)
-
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",
-                    "endereco_mac": mac, "data": data, "resumos": resumos
+                    "endereco_mac": mac, "data": data, "resumos": resumos,
+                    "lotes_atuais": referencias
                 }
-                # Omitimos a chave inteira (em vez de usar None) quando nao deu pra calcular -
-                # mesma convencao do tempo_no_estado em cada metrica.
-                if severidade is not None:
-                    diario["severidade"] = severidade
-                diario["lotes_atuais"] = referencias
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
                 preparar_envio(pasta, envios, destino, diario)
 
