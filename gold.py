@@ -9,6 +9,7 @@ import hashlib
 import sqlite3
 import math
 import requests
+from silver import processar_arquivos as processar_silver
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -667,6 +668,17 @@ def processar_gold():
             print("Arquivo JSON enviado para:", destino)
     print("Processamento Gold finalizado!")
 
+def lambda_handler(event, context):
+    print("=== Etapa 1: Processando camada Silver (raw/ -> trusted/) ===")
+    processar_silver()
+
+    print("=== Etapa 2: Processando camada Gold (trusted/ -> client/) ===")
+    processar_gold()
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps("Pipeline Silver + Gold finalizado com sucesso!")
+    }
 
 if __name__ == "__main__":
 
@@ -684,3 +696,6 @@ if __name__ == "__main__":
 
         print("Aguardando 5 minutos...")
         time.sleep(300)
+
+
+    
