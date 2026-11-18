@@ -420,3 +420,56 @@ def calcular_severidade(resumos):
         pior = 'critico'
 
     return pior
+
+
+# essa classe é tipo o AcumuladorTempoNoEstado, só que em vez de achar desde
+# quando o estado começou eu guardo o pior estado de cada balde de 5 min. usei
+# 5 min pq já é o mesmo ciclo que a gold e o java rodam hoje, nem pensei em
+# inventar outro número. isso vira a linha do tempo que o gráfico de evolução do
+# site vai mostrar, até agora só tinha o estado atual (severidade do dia
+# inteiro) e não dava pra saber o que tinha acontecido durante o dia
+#
+# reaproveitei a mesma validação de leitura do AcumuladorTempoNoEstado (linha
+# 349) e o classificar_estado que já existe (linha 262), só muda o que eu faço
+# com o resultado depois
+#
+# ainda não tratei oom aqui. o calcular_severidade força crítico se teve oom no
+# dia, mas ram_oom_kills não tem limite configurado em nenhum perfil (conferi no
+# database/script.sql), então cai no mesmo continue que qualquer métrica sem
+# limite cai, igual o AcumuladorTempoNoEstado já fazia antes de mim. fica pra
+# depois se precisar, não é esquecimento
+class AcumuladorEvolucao:
+    def __init__(self):
+        self.leituras_por_metrica = {}
+
+    def adicionar(self, metrica, instante, valor, status):
+        if metrica is None or status != 'ok' or valor is None:
+            return
+        if not isinstance(valor, (int, float)) or isinstance(valor, bool):
+            return
+        self.leituras_por_metrica.setdefault(metrica, []).append((instante, valor))
+
+    def calcular(self, limites_por_metrica):
+        # um balde só, compartilhado entre todas as métricas, pq preciso do pior
+        # estado entre todas elas no mesmo balde, não o pior de cada métrica
+        # separada. é basicamente o calcular_severidade, só que por balde de
+        # 5 min em vez de uma vez só no fim do dia
+        estado_por_balde = {}
+
+        for metrica, leituras in self.leituras_por_metrica.items():
+            limites = limites_por_metrica.get(metrica)
+            if limites is None:
+                continue  # sem limite configurado pra essa metrica nesse perfil, nao da pra classificar
+
+            for instante, valor in leituras:
+                balde = instante_utc(instante).floor('5min')
+                estado = classificar_estado(valor, limites)
+
+                atual = estado_por_balde.get(balde)
+                if atual is None or PESOS_SEVERIDADE[estado] > PESOS_SEVERIDADE[atual]:
+                    estado_por_balde[balde] = estado
+
+        return [
+            {'instante': balde.isoformat().replace('+00:00', 'Z'), 'estado': estado}
+            for balde, estado in sorted(estado_por_balde.items())
+        ]
