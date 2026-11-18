@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, calcular_severidade
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, calcular_severidade
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -518,6 +518,7 @@ def processar_gold():
     diarios = {}
     lotes_atuais = {}
     tempos_no_estado = {}  # (mac, data) -> AcumuladorTempoNoEstado, em paralelo aos "diarios"
+    evolucoes = {}  # (mac, data) -> AcumuladorEvolucao, mesma ideia do tempos_no_estado
     tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
 
@@ -587,8 +588,10 @@ def processar_gold():
                                 diarios[chave_dia] = AcumuladorResumo()
                                 lotes_atuais[chave_dia] = []
                                 tempos_no_estado[chave_dia] = AcumuladorTempoNoEstado()
+                                evolucoes[chave_dia] = AcumuladorEvolucao()
                             acumulador = diarios[chave_dia]
                             acumulador_tempo = tempos_no_estado[chave_dia]
+                            acumulador_evolucao = evolucoes[chave_dia]
                             lotes_atuais[chave_dia].append({
                                 "lote_id": lote_id, "chave": destino, "origem": lote["origem"]
                             })
@@ -614,18 +617,20 @@ def processar_gold():
                                     resumo = resumir_documento(observacao)
                                     acumulador.adicionar(resumo, registro["timestamp"])
 
-                                    # "Tempo no estado" precisa das leituras cruas, na ordem do
-                                    # tempo - por isso alimentamos um acumulador separado aqui,
-                                    # em vez de tentar extrair isso do resumo já combinado acima.
+                                    # tempo no estado e evolucao real precisam das leituras cruas,
+                                    # nao do resumo ja combinado la em cima, entao alimento os dois
+                                    # acumuladores aqui mesmo, na mesma passada
                                     if campo == "metricas":
                                         instante = registro["timestamp"]
-                                        para_cada_medida(
-                                            registro,
-                                            lambda leitura: acumulador_tempo.adicionar(
-                                                leitura.get("metrica"), instante,
-                                                leitura.get("valor"), leitura.get("status")
-                                            )
-                                        )
+
+                                        def _alimentar_leitura(leitura):
+                                            metrica = leitura.get("metrica")
+                                            valor = leitura.get("valor")
+                                            status = leitura.get("status")
+                                            acumulador_tempo.adicionar(metrica, instante, valor, status)
+                                            acumulador_evolucao.adicionar(metrica, instante, valor, status)
+
+                                        para_cada_medida(registro, _alimentar_leitura)
                     except Exception as erro:
                         raise ValueError(f"Falha em {chave}: {erro}") from erro
 
@@ -637,6 +642,7 @@ def processar_gold():
                 referencias = sorted(lotes_atuais[(mac, data)], key=chave_do_lote)
                 resumos = acumulador.resultado()
 
+                evolucao = None
                 tokens = tokens_por_mac.get(mac)
                 if tokens is not None:
                     if tokens not in cache_limites:
@@ -652,6 +658,8 @@ def processar_gold():
                                     leitura["tempo_no_estado"] = tempo
                             para_cada_medida(resumos, _injetar_tempo_no_estado)
 
+                        evolucao = evolucoes[(mac, data)].calcular(limites_por_metrica)
+
                 # A severidade usa o que acabamos de calcular acima (tempo_por_metrica
                 # ja injetado em "resumos"), mais a contagem de OOM que o resumo ja tinha
                 # antes disso - nao precisa de nenhuma chamada nova a API.
@@ -665,6 +673,11 @@ def processar_gold():
                 # mesma convencao do tempo_no_estado em cada metrica.
                 if severidade is not None:
                     diario["severidade"] = severidade
+                # evolucao vem vazia (lista []) quando nenhuma leitura bateu com algum
+                # limite configurado - mesmo "nao tem o que calcular" do severidade, so
+                # que aqui o "vazio" e uma lista, nao None
+                if evolucao:
+                    diario["evolucao"] = evolucao
                 diario["lotes_atuais"] = referencias
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
                 preparar_envio(pasta, envios, destino, diario)

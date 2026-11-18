@@ -374,11 +374,18 @@ PESOS_SEVERIDADE = {"normal": 0, "atencao": 1, "critico": 2}
 
 
 def calcular_severidade(resumos):
-    """Resume num unico campo, pro servidor inteiro, qual foi a pior situacao do dia.
+    """Resume num unico campo, pro servidor inteiro, qual e o estado ATUAL mais grave
+    entre as metricas - nao e o pior que ja aconteceu durante o dia, e sim o pior
+    "agora" (a ultima leitura de cada metrica). corrigindo uma imprecisao que eu
+    tinha deixado aqui antes: tinha escrito "pior situacao do dia", mas o calculo
+    sempre olhou so a ultima leitura de cada metrica, nunca o historico inteiro.
+    quem quiser saber se o servidor passou por algo pior e ja normalizou precisa
+    olhar o campo evolucao, nao esse aqui.
 
     Parte 1 - a pior metrica manda: percorremos todas as leituras do resumo que
     ganharam um tempo_no_estado (ou seja, tinham limite configurado no perfil - ver
-    AcumuladorTempoNoEstado.calcular) e pegamos o estado_atual mais grave entre elas.
+    AcumuladorTempoNoEstado.calcular) e pegamos o estado_atual (da ultima leitura)
+    mais grave entre elas.
     Se NENHUMA leitura tiver tempo_no_estado - a API de limites pode ter caido nesse dia,
     ou o perfil simplesmente nao configurou limite pra nenhuma metrica - nao inventamos
     um valor "normal" por omissao: devolvemos None, e quem chamar essa funcao (gold.py)
