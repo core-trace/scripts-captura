@@ -4,7 +4,7 @@ import pandas as pd
 from copy import deepcopy
 from formato_gold import identidade_recurso, para_cada_medida
 
-def instante_comparavel(instante):
+def instante_utc(instante):
 
     # Converte o texto em um Timestamp do Pandas.
     # Isso também preserva a precisão de nanossegundos.
@@ -18,9 +18,15 @@ def instante_comparavel(instante):
     if horario.tzinfo is None:
         horario = horario.tz_localize("America/Sao_Paulo")
 
-    # Converte para UTC e retorna o valor em nanossegundos.
-    # Assim todos os horários podem ser comparados igualmente.
-    return horario.tz_convert("UTC").value
+    return horario.tz_convert("UTC")
+
+# puxei isso pra fora do instante_comparavel pq vou precisar do Timestamp em si
+# (nao só do numero em nanossegundos) pra arredondar pro balde de 5 min na evolucao -
+# e nao queria copiar a parte do fuso horario de novo, essa conta ja tem uma pegadinha
+# (tradicional vs docker) que só existe escrita uma vez
+def instante_comparavel(instante):
+    # Valor em nanossegundos, pra poder comparar/ordenar horarios igual
+    return instante_utc(instante).value
 
 # Aqui juntamos o que já foi calculado com as novas amostras que chegaram
 # A cópia evita mudar o resumo anterior enquanto ainda estamos usando ele na conta
