@@ -38,13 +38,13 @@ def coletar_processos(timestamp, endereco_mac, limite=50):
                 "ENDERECO_MAC": endereco_mac,
                 "PID": info["pid"],
                 "NOME": info["name"],
-                "USUARIO": info.get["username"],
+                "USUARIO": info.get("username"),
                 "CPU_PERCENT": info["cpu_percent"],
                 "MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2),
                 "RSS_BYTES": rss_bytes,
                 "NUM_THREADS": info["num_threads"],
                 "CREATE_TIME": create_time,
-                "STATUS": info.get["status"],
+                "STATUS": info.get("status"),
             })
 
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
