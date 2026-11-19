@@ -4,7 +4,7 @@ import pandas as pd
 from copy import deepcopy
 from formato_gold import identidade_recurso, para_cada_medida
 
-def instante_comparavel(instante):
+def instante_utc(instante):
 
     # Converte o texto em um Timestamp do Pandas.
     # Isso também preserva a precisão de nanossegundos.
@@ -18,9 +18,15 @@ def instante_comparavel(instante):
     if horario.tzinfo is None:
         horario = horario.tz_localize("America/Sao_Paulo")
 
-    # Converte para UTC e retorna o valor em nanossegundos.
-    # Assim todos os horários podem ser comparados igualmente.
-    return horario.tz_convert("UTC").value
+    return horario.tz_convert("UTC")
+
+# puxei isso pra fora do instante_comparavel pq vou precisar do Timestamp em si
+# (nao só do numero em nanossegundos) pra arredondar pro balde de 5 min na evolucao -
+# e nao queria copiar a parte do fuso horario de novo, essa conta ja tem uma pegadinha
+# (tradicional vs docker) que só existe escrita uma vez
+def instante_comparavel(instante):
+    # Valor em nanossegundos, pra poder comparar/ordenar horarios igual
+    return instante_utc(instante).value
 
 # Aqui juntamos o que já foi calculado com as novas amostras que chegaram
 # A cópia evita mudar o resumo anterior enquanto ainda estamos usando ele na conta
@@ -368,11 +374,18 @@ PESOS_SEVERIDADE = {"normal": 0, "atencao": 1, "critico": 2}
 
 
 def calcular_severidade(resumos):
-    """Resume num unico campo, pro servidor inteiro, qual foi a pior situacao do dia.
+    """Resume num unico campo, pro servidor inteiro, qual e o estado ATUAL mais grave
+    entre as metricas - nao e o pior que ja aconteceu durante o dia, e sim o pior
+    "agora" (a ultima leitura de cada metrica). corrigindo uma imprecisao que eu
+    tinha deixado aqui antes: tinha escrito "pior situacao do dia", mas o calculo
+    sempre olhou so a ultima leitura de cada metrica, nunca o historico inteiro.
+    quem quiser saber se o servidor passou por algo pior e ja normalizou precisa
+    olhar o campo evolucao, nao esse aqui.
 
     Parte 1 - a pior metrica manda: percorremos todas as leituras do resumo que
     ganharam um tempo_no_estado (ou seja, tinham limite configurado no perfil - ver
-    AcumuladorTempoNoEstado.calcular) e pegamos o estado_atual mais grave entre elas.
+    AcumuladorTempoNoEstado.calcular) e pegamos o estado_atual (da ultima leitura)
+    mais grave entre elas.
     Se NENHUMA leitura tiver tempo_no_estado - a API de limites pode ter caido nesse dia,
     ou o perfil simplesmente nao configurou limite pra nenhuma metrica - nao inventamos
     um valor "normal" por omissao: devolvemos None, e quem chamar essa funcao (gold.py)
@@ -414,3 +427,56 @@ def calcular_severidade(resumos):
         pior = 'critico'
 
     return pior
+
+
+# essa classe é tipo o AcumuladorTempoNoEstado, só que em vez de achar desde
+# quando o estado começou eu guardo o pior estado de cada balde de 5 min. usei
+# 5 min pq já é o mesmo ciclo que a gold e o java rodam hoje, nem pensei em
+# inventar outro número. isso vira a linha do tempo que o gráfico de evolução do
+# site vai mostrar, até agora só tinha o estado atual (severidade do dia
+# inteiro) e não dava pra saber o que tinha acontecido durante o dia
+#
+# reaproveitei a mesma validação de leitura do AcumuladorTempoNoEstado (linha
+# 349) e o classificar_estado que já existe (linha 262), só muda o que eu faço
+# com o resultado depois
+#
+# ainda não tratei oom aqui. o calcular_severidade força crítico se teve oom no
+# dia, mas ram_oom_kills não tem limite configurado em nenhum perfil (conferi no
+# database/script.sql), então cai no mesmo continue que qualquer métrica sem
+# limite cai, igual o AcumuladorTempoNoEstado já fazia antes de mim. fica pra
+# depois se precisar, não é esquecimento
+class AcumuladorEvolucao:
+    def __init__(self):
+        self.leituras_por_metrica = {}
+
+    def adicionar(self, metrica, instante, valor, status):
+        if metrica is None or status != 'ok' or valor is None:
+            return
+        if not isinstance(valor, (int, float)) or isinstance(valor, bool):
+            return
+        self.leituras_por_metrica.setdefault(metrica, []).append((instante, valor))
+
+    def calcular(self, limites_por_metrica):
+        # um balde só, compartilhado entre todas as métricas, pq preciso do pior
+        # estado entre todas elas no mesmo balde, não o pior de cada métrica
+        # separada. é basicamente o calcular_severidade, só que por balde de
+        # 5 min em vez de uma vez só no fim do dia
+        estado_por_balde = {}
+
+        for metrica, leituras in self.leituras_por_metrica.items():
+            limites = limites_por_metrica.get(metrica)
+            if limites is None:
+                continue  # sem limite configurado pra essa metrica nesse perfil, nao da pra classificar
+
+            for instante, valor in leituras:
+                balde = instante_utc(instante).floor('5min')
+                estado = classificar_estado(valor, limites)
+
+                atual = estado_por_balde.get(balde)
+                if atual is None or PESOS_SEVERIDADE[estado] > PESOS_SEVERIDADE[atual]:
+                    estado_por_balde[balde] = estado
+
+        return [
+            {'instante': balde.isoformat().replace('+00:00', 'Z'), 'estado': estado}
+            for balde, estado in sorted(estado_por_balde.items())
+        ]
