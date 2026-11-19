@@ -1,4 +1,5 @@
 import psutil
+from datetime import datetime
 
 COLUNAS_PROCESSOS = [
     "TIMESTAMP",
@@ -30,13 +31,14 @@ def coletar_processos(timestamp, endereco_mac, limite=50):
 
             create_time = info.get("create_time")
             if create_time is not None:
-                create_time = datetime.fromtimestamp(create_time).strftime("%Y-%m-$d %H:%M:%S")
+                create_time = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S")
 
             linhas.append({
                 "TIMESTAMP": timestamp,
                 "ENDERECO_MAC": endereco_mac,
                 "PID": info["pid"],
                 "NOME": info["name"],
+                "USUARIO": info.get["username"],
                 "CPU_PERCENT": info["cpu_percent"],
                 "MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2),
                 "RSS_BYTES": rss_bytes,
