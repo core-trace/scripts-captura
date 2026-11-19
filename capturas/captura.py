@@ -92,7 +92,7 @@ API_BASE_URL = "http://localhost:3333"
 
 ARQUIVO_CONFIG = Path(__file__).resolve().parent.parent / "config.json"
 
-BUCKET = "bucket-coretrace"
+BUCKET = "testecoretrace"
 PASTA_S3 = "raw"
 
 s3 = None
@@ -503,6 +503,7 @@ def main():
     escritor_processos.writeheader()
 
     ultimo_envio = time.monotonic()
+
 
     try:
         while True:

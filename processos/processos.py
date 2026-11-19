@@ -51,6 +51,6 @@ def coletar_processos(timestamp, endereco_mac, limite=50):
             continue
 
     # Grava só os N mais pesados, senão seriam centenas de linhas por segundo
-    linhas.sort(key=lambda linha: linha["CPU_PERCENT"] or 0, reverse=True)
+    linhas.sort(key=lambda linha: linha["CPU_PERCENT"] or 0,linha["RSS_BYTES"] or 0, linha["PID"] or 0, reverse=True)
 
     return linhas[:limite]
