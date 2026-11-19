@@ -526,6 +526,12 @@ def processar_gold():
         pasta = Path(temporaria)
         with closing(sqlite3.connect(pasta / "ids.sqlite")) as vistos:
             vistos.execute("CREATE TABLE vistos (id TEXT PRIMARY KEY) WITHOUT ROWID")
+            # Guarda as mensagens em disco até montar o resumo de cada máquina/dia.
+            vistos.execute(
+                "CREATE TABLE logs_diarios (mac TEXT, dia TEXT, instante INTEGER, "
+                "id TEXT PRIMARY KEY, registro TEXT)"
+            )
+            vistos.execute("CREATE INDEX logs_por_dia ON logs_diarios (mac, dia, instante, id)")
             paginador = s3.get_paginator("list_objects_v2")
             paginas = paginador.paginate(Bucket=BUCKET, Prefix=SILVER)
 
@@ -609,6 +615,13 @@ def processar_gold():
                                     (registro["id_captura"],)
                                 )
                                 if consulta.rowcount == 1:
+                                    if campo == "logs":
+                                        vistos.execute(
+                                            "INSERT INTO logs_diarios VALUES (?, ?, ?, ?, ?)",
+                                            (mac, data, pd.Timestamp(registro["timestamp"]).value,
+                                             registro["id_captura"],
+                                             json.dumps(registro, ensure_ascii=False, allow_nan=False))
+                                        )
                                     observacao = novo_documento(mac, data)
                                     observacao[campo] = [registro]
                                     resumo = resumir_documento(observacao)
@@ -659,7 +672,15 @@ def processar_gold():
 
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",
-                    "endereco_mac": mac, "data": data, "resumos": resumos
+                    "endereco_mac": mac, "data": data, "resumos": resumos,
+                    # Mesmo formato dos lotes; as contagens continuam em resumos.logs.
+                    "logs": [
+                        json.loads(registro)
+                        for (registro,) in vistos.execute(
+                            "SELECT registro FROM logs_diarios WHERE mac = ? AND dia = ? "
+                            "ORDER BY instante, id", (mac, data)
+                        )
+                    ]
                 }
                 # Omitimos a chave inteira (em vez de usar None) quando nao deu pra calcular -
                 # mesma convencao do tempo_no_estado em cada metrica.
