@@ -1271,8 +1271,19 @@ def gerar_linhas_processos():
 
     O arquivo tem as colunas reais do agente (COLUNAS_PROCESSOS, de
     `processos/processos.py`): TIMESTAMP, ENDERECO_MAC, PID, NOME, USUARIO,
-    CPU_PERCENT e MEMORIA_PERCENT.
+    CPU_PERCENT, MEMORIA_PERCENT, RSS_BYTES, NUM_THREADS, CREATE_TIME e STATUS.
+    RSS_BYTES é bytes inteiro e CREATE_TIME é string "%Y-%m-%d %H:%M:%S", como
+    o agente grava a partir do psutil.
     """
+    threads_por_nome = {
+        "java": 48,
+        "worker": 24,
+        "node": 12,
+        "python": 6,
+        "nginx": 4,
+        "mysqld": 32,
+    }
+
     linhas = []
 
     for definicao in PROCESSOS_NARRADOS + PROCESSOS_EXTRAPOLADOS:
@@ -1282,8 +1293,11 @@ def gerar_linhas_processos():
         cpu = curva(definicao["cpu_ancoras"])
         rss = curva(definicao["rss_ancoras_gb"])
 
-        ram_total_gb = gib_para_gb(servidor["ram_gib"])
         fim_captura = servidor.get("fim_captura", FIM)
+        # O processo já estava de pé antes da janela; o agente converte o epoch
+        # do psutil para esse formato de string.
+        create_time = (INICIO - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+        threads_base = threads_por_nome[definicao["nome"]]
 
         for horario in horarios_da_janela():
             if horario > fim_captura:
@@ -1293,7 +1307,11 @@ def gerar_linhas_processos():
             # um processo real nunca fica parado exatamente no mesmo valor.
             cpu_percent = round(cpu(horario) + aleatorio.uniform(-0.4, 0.4), 2)
             rss_gb = max(0.001, rss(horario) + aleatorio.uniform(-0.02, 0.02))
-            memoria_percent = round(rss_gb / ram_total_gb * 100, 2)
+            rss_bytes = int(rss_gb * (1024 ** 3))
+            # O psutil calcula a porcentagem sobre bytes, então o denominador
+            # usa a mesma base GiB do RSS do cenário.
+            memoria_percent = round(rss_bytes / (servidor["ram_gib"] * (1024 ** 3)) * 100, 2)
+            num_threads = max(1, threads_base + aleatorio.randint(-2, 2))
 
             linhas.append({
                 "TIMESTAMP": horario.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1303,6 +1321,10 @@ def gerar_linhas_processos():
                 "USUARIO": definicao["usuario"],
                 "CPU_PERCENT": max(0.0, cpu_percent),
                 "MEMORIA_PERCENT": memoria_percent,
+                "RSS_BYTES": rss_bytes,
+                "NUM_THREADS": num_threads,
+                "CREATE_TIME": create_time,
+                "STATUS": "running",
             })
 
     return linhas
