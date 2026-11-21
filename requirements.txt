@@ -3,3 +3,4 @@ pandas==2.2.3
 psutil==7.2.2
 requests==2.34.2
 docker==7.1.0
+PyMySQL==1.2.4
