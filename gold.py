@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, calcular_severidade
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, AcumuladorEstadoRecursos, calcular_severidade, piores_recursos, estado_por_categoria
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -22,7 +22,8 @@ from formato_gold import (
     organizar_evento,
     organizar_log,
     resumir_documento,
-    para_cada_medida
+    para_cada_medida,
+    para_cada_medida_com_recurso
 )
 
 BUCKET = "bucket-coretrace"
@@ -519,6 +520,7 @@ def processar_gold():
     lotes_atuais = {}
     tempos_no_estado = {}  # (mac, data) -> AcumuladorTempoNoEstado, em paralelo aos "diarios"
     evolucoes = {}  # (mac, data) -> AcumuladorEvolucao, mesma ideia do tempos_no_estado
+    estados_recursos = {}  # (mac, data) -> AcumuladorEstadoRecursos, estado por núcleo/volume/interface
     tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
 
@@ -595,9 +597,11 @@ def processar_gold():
                                 lotes_atuais[chave_dia] = []
                                 tempos_no_estado[chave_dia] = AcumuladorTempoNoEstado()
                                 evolucoes[chave_dia] = AcumuladorEvolucao()
+                                estados_recursos[chave_dia] = AcumuladorEstadoRecursos()
                             acumulador = diarios[chave_dia]
                             acumulador_tempo = tempos_no_estado[chave_dia]
                             acumulador_evolucao = evolucoes[chave_dia]
+                            acumulador_recursos = estados_recursos[chave_dia]
                             lotes_atuais[chave_dia].append({
                                 "lote_id": lote_id, "chave": destino, "origem": lote["origem"]
                             })
@@ -644,6 +648,16 @@ def processar_gold():
                                             acumulador_evolucao.adicionar(metrica, instante, valor, status)
 
                                         para_cada_medida(registro, _alimentar_leitura)
+                                        # estado por recurso (núcleo, volume, interface) e horário da captura, pra dashboard do Marcelo
+                                        def _alimentar_recurso(leitura, categoria, recurso):
+                                            acumulador_recursos.adicionar(
+                                                categoria, recurso, leitura.get("metrica"), instante,
+                                                leitura.get("valor"), leitura.get("status"),
+                                                leitura.get("unidade"), leitura.get("tipo")
+                                            )
+
+                                        para_cada_medida_com_recurso(registro, _alimentar_recurso)
+                                        acumulador_recursos.registrar_captura(instante)
                     except Exception as erro:
                         raise ValueError(f"Falha em {chave}: {erro}") from erro
 
@@ -677,6 +691,12 @@ def processar_gold():
                 # ja injetado em "resumos"), mais a contagem de OOM que o resumo ja tinha
                 # antes disso - nao precisa de nenhuma chamada nova a API.
                 severidade = calcular_severidade(resumos)
+                # Estado de cada recurso (núcleo, volume, interface...) com valor atual e desde quando.
+                # Reaproveita a consulta de limites feita acima (cache_limites), sem nova chamada à API.
+                limites_estado = None
+                if tokens is not None:
+                    limites_estado = cache_limites.get(tokens)
+                estado_recursos = estados_recursos[(mac, data)].calcular(limites_estado)
 
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",
@@ -700,6 +720,21 @@ def processar_gold():
                 if evolucao:
                     diario["evolucao"] = evolucao
                 diario["lotes_atuais"] = referencias
+                # Campos extras pro consumo da dashboard do Marcelo. O que já existia no resumo não muda.
+                # Mesma convenção dos outros: omitimos a chave quando não deu pra calcular.
+                diario["gerado_em"] = pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
+                # False quando a API de limites não respondeu: quem lê não deve tratar a falta de estado como "normal".
+                diario["classificacao_disponivel"] = limites_estado is not None
+                ultima_coleta = estados_recursos[(mac, data)].ultima_coleta_iso()
+                if ultima_coleta is not None:
+                    diario["ultima_coleta"] = ultima_coleta
+                ultimo_oom = estados_recursos[(mac, data)].ultimo_oom_iso()
+                if ultimo_oom is not None:
+                    diario["ultimo_oom_em"] = ultimo_oom
+                if estado_recursos:
+                    diario["recursos_estado"] = estado_recursos
+                    diario["piores_recursos"] = piores_recursos(estado_recursos)
+                    diario["estado_por_categoria"] = estado_por_categoria(estado_recursos)
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
                 preparar_envio(pasta, envios, destino, diario)
 

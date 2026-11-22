@@ -28,6 +28,11 @@ def instante_comparavel(instante):
     # Valor em nanossegundos, pra poder comparar/ordenar horarios igual
     return instante_utc(instante).value
 
+# Mesmo instante, em UTC e no formato ISO com Z, igual ao que a evolução já entrega.
+# Os campos novos do resumo (dashboard de servidores) usam isso pra quem lê não precisar saber o fuso da captura.
+def instante_iso_utc(instante):
+    return instante_utc(instante).isoformat().replace('+00:00', 'Z')
+
 # Aqui juntamos o que já foi calculado com as novas amostras que chegaram
 # A cópia evita mudar o resumo anterior enquanto ainda estamos usando ele na conta
 def combinar_medidas(anterior, nova, mais_recente):
@@ -74,6 +79,20 @@ def combinar_medidas(anterior, nova, mais_recente):
                 resultado[campo] = calcular(valores)
             else:
                 resultado[campo] = None
+        # Último valor válido da medição e o instante dele. Se a amostra mais recente veio
+        # sem valor válido, vale o da outra: o valor atual nunca vira null por causa de uma
+        # leitura ruim.
+        candidatos = []
+        for resumo in (anterior, nova):
+            if resumo.get('ultimo_valor') is not None and resumo.get('ultimo_instante'):
+                candidatos.append(resumo)
+        if candidatos:
+            melhor = max(candidatos, key=lambda resumo: instante_comparavel(resumo['ultimo_instante']))
+            resultado['ultimo_valor'] = melhor['ultimo_valor']
+            resultado['ultimo_instante'] = melhor['ultimo_instante']
+        else:
+            resultado['ultimo_valor'] = None
+            resultado['ultimo_instante'] = None
 
     elif tipo in ('eventos_intervalo', 'delta_intervalo'):
         # Aqui são valores novos daquele intervalo, então eles podem ser somados
@@ -124,6 +143,17 @@ def atualizar(estrutura, valor, instante, nome=''):
             for campo, conteudo in valor.items():
                 if campo not in ('recebidos', 'enviados'):
                     medida[campo] = conteudo
+
+            # O resumo só tinha média, mínimo e máximo das medições, sem o valor ATUAL. Cada observação
+            # que chega aqui vem de uma única captura, então quando existe 1 amostra válida a média dela
+            # é o próprio valor lido. Tipos que já têm ultimo_valor (inventário, contador, estado) ficam como estão.
+            if medida.get('tipo') == 'medicao' and 'ultimo_valor' not in medida:
+                if medida.get('amostras_validas') == 1 and medida.get('media') is not None:
+                    medida['ultimo_valor'] = medida['media']
+                    medida['ultimo_instante'] = instante_iso_utc(instante)
+                else:
+                    medida['ultimo_valor'] = None
+                    medida['ultimo_instante'] = None
 
             estrutura['tipo'] = 'medida'
             estrutura['valor'] = combinar_medidas(estrutura.get('valor'), medida, mais_recente)
@@ -480,3 +510,164 @@ class AcumuladorEvolucao:
             {'instante': balde.isoformat().replace('+00:00', 'Z'), 'estado': estado}
             for balde, estado in sorted(estado_por_balde.items())
         ]
+
+
+# Estado ATUAL de cada recurso do servidor (núcleo da CPU, volume, dispositivo, interface),
+# pra dashboard do Marcelo. É paralelo ao AcumuladorTempoNoEstado, de propósito: aquele agrupa
+# por nome de métrica (limitação conhecida nº 2) e aqui a chave é (métrica, recurso), então um
+# núcleo em 100% não se perde no meio dos outros. Usa o mesmo calcular_tempo_no_estado e o mesmo
+# classificar_estado, então a conta bate com o tempo_no_estado e com a do Java.
+#
+# Também guarda o horário da última captura de métricas (o "fim" do resumo mistura processos,
+# containers e logs) e o horário do último OOM, pra quem lê aplicar a janela que quiser.
+#
+# Mesma limitação do AcumuladorTempoNoEstado: guarda as leituras do dia em memória, sem teto.
+class AcumuladorEstadoRecursos:
+    def __init__(self):
+        self.series = {}
+        self.ultima_captura = None  # (nanossegundos, instante original)
+        self.ultimo_oom = None  # (nanossegundos, instante original)
+        self.ultimo_texto = None  # guarda o último instante convertido, evita converter igual várias vezes
+        self.ultimo_ns = None
+
+    def _nanossegundos(self, instante):
+        # Todas as medidas de uma mesma captura têm o mesmo instante, então convertemos uma vez só
+        if instante != self.ultimo_texto:
+            self.ultimo_ns = instante_comparavel(instante)
+            self.ultimo_texto = instante
+        return self.ultimo_ns
+
+    def registrar_captura(self, instante):
+        ns = self._nanossegundos(instante)
+        if self.ultima_captura is None or ns > self.ultima_captura[0]:
+            self.ultima_captura = (ns, instante)
+
+    def adicionar(self, categoria, recurso, metrica, instante, valor, status, unidade, tipo):
+        # Só leituras válidas entram, igual ao AcumuladorTempoNoEstado.
+        if metrica is None or status != 'ok' or valor is None:
+            return
+        if not isinstance(valor, (int, float)) or isinstance(valor, bool):
+            return
+
+        ns = self._nanossegundos(instante)
+
+        # OOM não tem limite no catálogo (ver calcular_severidade): guardamos só o horário do último.
+        if metrica == 'ram_oom_kills' and valor > 0:
+            if self.ultimo_oom is None or ns > self.ultimo_oom[0]:
+                self.ultimo_oom = (ns, instante)
+
+        # Inventário e contadores acumulados não são comparados com limite.
+        if tipo not in ('medicao', 'estado'):
+            return
+
+        identidade = None
+        if recurso is not None:
+            identidade = (recurso['tipo'], recurso['identificador'])
+        chave = (metrica, identidade)
+
+        serie = self.series.get(chave)
+        if serie is None:
+            serie = {'categoria': categoria, 'metrica': metrica, 'recurso': recurso,
+                     'unidade': unidade, 'leituras': []}
+            self.series[chave] = serie
+        serie['leituras'].append((ns, instante, valor))
+
+    def ultima_coleta_iso(self):
+        if self.ultima_captura is None:
+            return None
+        return instante_iso_utc(self.ultima_captura[1])
+
+    def ultimo_oom_iso(self):
+        if self.ultimo_oom is None:
+            return None
+        return instante_iso_utc(self.ultimo_oom[1])
+
+    def calcular(self, limites_por_metrica):
+        # Sem limites (API fora do ar, por exemplo) não dá pra classificar: devolve lista vazia.
+        if limites_por_metrica is None:
+            return []
+
+        resultado = []
+        for serie in self.series.values():
+            limites = limites_por_metrica.get(serie['metrica'])
+            if limites is None:
+                continue  # métrica sem limite configurado nesse perfil: nada pra comparar
+
+            ordenadas = sorted(serie['leituras'], key=lambda leitura: leitura[0])
+            pares = []
+            for ns, instante, valor in ordenadas:
+                pares.append((instante, valor))
+
+            tempo = calcular_tempo_no_estado(pares, limites)
+            if tempo is None:
+                continue
+
+            ultimo_instante, ultimo_valor = pares[-1]
+            item = {
+                'categoria': serie['categoria'],
+                'metrica': serie['metrica'],
+                'recurso': serie['recurso'],
+                'unidade': serie['unidade'],
+                'valor_atual': ultimo_valor,
+                'instante': instante_iso_utc(ultimo_instante),
+                'estado': tempo['estado_atual'],
+                'limites': {
+                    'operador': limites.get('operador'),
+                    'limite_atencao': limites.get('limite_atencao'),
+                    'limite_critico': limites.get('limite_critico'),
+                    'operador_2': limites.get('operador_2'),
+                    'limite_atencao_2': limites.get('limite_atencao_2'),
+                    'limite_critico_2': limites.get('limite_critico_2'),
+                }
+            }
+            for campo in ('em_atencao_desde', 'em_critico_desde'):
+                if campo in tempo:
+                    item[campo] = instante_iso_utc(tempo[campo])
+            resultado.append(item)
+
+        resultado.sort(key=_ordem_recurso)
+        return resultado
+
+
+# Ordem estável: categoria, métrica e recurso (núcleo 2 antes do 10, não por texto).
+def _ordem_recurso(item):
+    recurso = item['recurso']
+    tipo = ''
+    numero = 0
+    texto = ''
+    if recurso is not None:
+        tipo = recurso['tipo']
+        texto = str(recurso['identificador'])
+        if isinstance(recurso['identificador'], int):
+            numero = recurso['identificador']
+    return (item['categoria'], item['metrica'], tipo, numero, texto)
+
+
+# Só o que precisa de atenção, do mais grave pro menos grave. Entre dois do mesmo nível vem
+# primeiro quem está há mais tempo nesse estado. O "desde" é o do nível atual do recurso.
+def piores_recursos(recursos_estado):
+    piores = []
+    for item in recursos_estado:
+        if item['estado'] == 'critico':
+            desde = item.get('em_critico_desde')
+        elif item['estado'] == 'atencao':
+            desde = item.get('em_atencao_desde')
+        else:
+            continue
+        entrada = dict(item)
+        entrada['desde'] = desde
+        piores.append(entrada)
+
+    piores.sort(key=lambda entrada: (-PESOS_SEVERIDADE[entrada['estado']], instante_comparavel(entrada['desde'])))
+    return piores
+
+
+# Estado mais grave de cada categoria (cpu, ram, disco, rede...), incluindo "normal".
+# Serve pros cards do servidor: cada recurso mostra a própria cor mesmo sem estar crítico.
+def estado_por_categoria(recursos_estado):
+    resultado = {}
+    for item in recursos_estado:
+        atual = resultado.get(item['categoria'])
+        if atual is None or PESOS_SEVERIDADE[item['estado']] > PESOS_SEVERIDADE[atual]:
+            resultado[item['categoria']] = item['estado']
+    return resultado
