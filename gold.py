@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, AcumuladorEstadoRecursos, calcular_severidade, piores_recursos, estado_por_categoria
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, AcumuladorEstadoRecursos, AcumuladorPrevisao, calcular_severidade, piores_recursos, estado_por_categoria
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -521,6 +521,7 @@ def processar_gold():
     tempos_no_estado = {}  # (mac, data) -> AcumuladorTempoNoEstado, em paralelo aos "diarios"
     evolucoes = {}  # (mac, data) -> AcumuladorEvolucao, mesma ideia do tempos_no_estado
     estados_recursos = {}  # (mac, data) -> AcumuladorEstadoRecursos, estado por núcleo/volume/interface
+    previsoes = {}  # (mac, data) -> AcumuladorPrevisao, mesma ideia tambem
     tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
 
@@ -598,10 +599,12 @@ def processar_gold():
                                 tempos_no_estado[chave_dia] = AcumuladorTempoNoEstado()
                                 evolucoes[chave_dia] = AcumuladorEvolucao()
                                 estados_recursos[chave_dia] = AcumuladorEstadoRecursos()
+                                previsoes[chave_dia] = AcumuladorPrevisao()
                             acumulador = diarios[chave_dia]
                             acumulador_tempo = tempos_no_estado[chave_dia]
                             acumulador_evolucao = evolucoes[chave_dia]
                             acumulador_recursos = estados_recursos[chave_dia]
+                            acumulador_previsao = previsoes[chave_dia]
                             lotes_atuais[chave_dia].append({
                                 "lote_id": lote_id, "chave": destino, "origem": lote["origem"]
                             })
@@ -646,6 +649,7 @@ def processar_gold():
                                             status = leitura.get("status")
                                             acumulador_tempo.adicionar(metrica, instante, valor, status)
                                             acumulador_evolucao.adicionar(metrica, instante, valor, status)
+                                            acumulador_previsao.adicionar(metrica, instante, valor, status)
 
                                         para_cada_medida(registro, _alimentar_leitura)
                                         # estado por recurso (núcleo, volume, interface) e horário da captura, pra dashboard do Marcelo
@@ -686,6 +690,14 @@ def processar_gold():
                             para_cada_medida(resumos, _injetar_tempo_no_estado)
 
                         evolucao = evolucoes[(mac, data)].calcular(limites_por_metrica)
+
+                        previsao_por_metrica = previsoes[(mac, data)].calcular(limites_por_metrica)
+                        if previsao_por_metrica:
+                            def _injetar_previsao(leitura):
+                                previsao = previsao_por_metrica.get(leitura.get("metrica"))
+                                if previsao is not None:
+                                    leitura["previsao_limite"] = previsao
+                            para_cada_medida(resumos, _injetar_previsao)
 
                 # A severidade usa o que acabamos de calcular acima (tempo_por_metrica
                 # ja injetado em "resumos"), mais a contagem de OOM que o resumo ja tinha

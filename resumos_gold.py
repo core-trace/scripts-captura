@@ -1,4 +1,5 @@
 """Junta os resumos aos poucos, sem guardar todas as capturas do dia na memória."""
+import math
 import pandas as pd
 
 from copy import deepcopy
@@ -396,6 +397,83 @@ class AcumuladorTempoNoEstado:
         return resultado
 
 
+# previsao de quando uma metrica vai cruzar o proximo limite, olhando so 2
+# pontos (inicio e fim) - mesma ideia do preverVolume que
+# ja existe em website/public/scripts/dashboardDados.js, so que em minutos em
+# vez de dias, pq cpu/ram variam rapido demais pra fazer sentido medir em dias
+# importante usar só os ultimos 30 min, nao o dia inteiro
+
+JANELA_PREVISAO_MINUTOS = 30
+# previsao de mais de 2h nao e mais "risco em acompanhamento", e so ruido longe
+# demais pra alguem agir rapido
+HORIZONTE_MAXIMO_MINUTOS = 120
+
+# só funciona pra metrica "quanto maior pior" (operador >), que e o unico jeito
+# que o projeto configura hoje 
+def calcular_previsao(leituras_ordenadas, limites):
+    if len(leituras_ordenadas) < 3:
+        return None  # pouca amostra, previsao ia ser chute
+
+    ultimo_instante, ultimo_valor = leituras_ordenadas[-1]
+    limite_da_janela = instante_utc(ultimo_instante) - pd.Timedelta(minutes=JANELA_PREVISAO_MINUTOS)
+    recentes = [par for par in leituras_ordenadas if instante_utc(par[0]) >= limite_da_janela]
+
+    if len(recentes) < 3:
+        return None  # pouca amostra na janela recente
+
+    primeiro_instante, primeiro_valor = recentes[0]
+
+    minutos_decorridos = (instante_utc(ultimo_instante) - instante_utc(primeiro_instante)).total_seconds() / 60
+    if minutos_decorridos < 10:
+        return None  # janela curta demais, previsao ia ser so ruido
+
+    estado_atual = classificar_estado(ultimo_valor, limites)
+    if estado_atual == 'critico':
+        return None  # ja chegou, nao ha mais o que prever
+
+    alvo = limites.get('limite_atencao') if estado_atual == 'normal' else limites.get('limite_critico')
+    if alvo is None:
+        return None
+
+    crescimento_por_minuto = (ultimo_valor - primeiro_valor) / minutos_decorridos
+    if crescimento_por_minuto <= 0:
+        return None  # estavel ou melhorando, nunca vai cruzar nada
+
+    minutos_estimados = math.ceil((alvo - ultimo_valor) / crescimento_por_minuto)
+    if minutos_estimados > HORIZONTE_MAXIMO_MINUTOS:
+        return None  # longe demais pra ser "risco em acompanhamento"
+
+    proximo_estado = 'atencao' if estado_atual == 'normal' else 'critico'
+    return {'proximo_estado': proximo_estado, 'limite': alvo, 'minutos_estimados': minutos_estimados}
+
+
+# Mesmo esqueleto do AcumuladorTempoNoEstado, só trocando o calculo do fim
+class AcumuladorPrevisao:
+    def __init__(self):
+        self.leituras_por_metrica = {}
+
+    def adicionar(self, metrica, instante, valor, status):
+        # nao mudei nada aqui do temponoestado
+        if metrica is None or status != 'ok' or valor is None:
+            return
+        if not isinstance(valor, (int, float)) or isinstance(valor, bool):
+            return
+        self.leituras_por_metrica.setdefault(metrica, []).append((instante, valor))
+
+    def calcular(self, limites_por_metrica):
+        resultado = {}
+        for metrica, leituras in self.leituras_por_metrica.items():
+            limites = limites_por_metrica.get(metrica)
+            if limites is None:
+                continue  # metrica sem limite configurado nesse perfil: nada pra prever
+
+            leituras_ordenadas = sorted(leituras, key=lambda par: instante_comparavel(par[0]))
+            previsao = calcular_previsao(leituras_ordenadas, limites)
+            if previsao is not None:
+                resultado[metrica] = previsao
+        return resultado
+
+
 # Mesma ordem de gravidade do "pesos" usado em website/public/scripts/dashboardDados.js
 # (maior(a, b) do front), só que sem o nivel "sem-dados": a Gold nunca lida com ele,
 # nem como entrada (AcumuladorTempoNoEstado so compara leituras validas) nem como saida
@@ -465,16 +543,6 @@ def calcular_severidade(resumos):
 # inventar outro número. isso vira a linha do tempo que o gráfico de evolução do
 # site vai mostrar, até agora só tinha o estado atual (severidade do dia
 # inteiro) e não dava pra saber o que tinha acontecido durante o dia
-#
-# reaproveitei a mesma validação de leitura do AcumuladorTempoNoEstado (linha
-# 349) e o classificar_estado que já existe (linha 262), só muda o que eu faço
-# com o resultado depois
-#
-# ainda não tratei oom aqui. o calcular_severidade força crítico se teve oom no
-# dia, mas ram_oom_kills não tem limite configurado em nenhum perfil (conferi no
-# database/script.sql), então cai no mesmo continue que qualquer métrica sem
-# limite cai, igual o AcumuladorTempoNoEstado já fazia antes de mim. fica pra
-# depois se precisar, não é esquecimento
 class AcumuladorEvolucao:
     def __init__(self):
         self.leituras_por_metrica = {}
