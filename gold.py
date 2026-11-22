@@ -1,6 +1,5 @@
 """Lê os CSVs da trusted e publica lotes JSON e resumos separados no client."""
 import io
-import os
 import time
 import boto3
 import pandas as pd
@@ -16,7 +15,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
 from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, calcular_severidade
-from resumos_gold import instante_utc
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -515,260 +513,6 @@ def chave_do_lote(referencia):
     return referencia["chave"]
 
 
-#  Dashboard por perfil
-
-
-PERIODOS_PERFIS = [30, 60, 420, 1440]
-INATIVIDADE_PERFIS_MS = 15 * 60 * 1000
-
-
-# O banco informa quem são os servidores, seus perfis e os limites cadastrados.
-# consulta o banco de dados
-def buscar_cadastros_perfis():
-    import pymysql
-    # python se conecta ao banco
-
-    from decimal import Decimal
-    conexao = pymysql.connect(
-        host=os.environ["DB_HOST"], port=int(os.environ.get("DB_PORT", "3306")),
-        database=os.environ["DB_DATABASE"], user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"], cursorclass=pymysql.cursors.DictCursor,
-        charset="utf8mb4", connect_timeout=10, read_timeout=30, write_timeout=30
-    )
-    try:
-        with conexao.cursor() as cursor:
-            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
-            #buscar qual empresa cada perfil pertence
-            cursor.execute("SELECT id_perfil_servidor, nome, fk_empresa FROM perfil_servidor ORDER BY nome, id_perfil_servidor")
-            perfis = cursor.fetchall()
-            #qual servidor pertence a qual perfil
-            cursor.execute("SELECT id_servidor, endereco_mac, fk_perfil_servidor FROM servidores ORDER BY id_servidor")
-            servidores = cursor.fetchall()
-            #buscar os limites associaaos a cada componente de cada perfil de cada empresa 
-            cursor.execute("""SELECT cp.fk_perfil_servidor, c.id_componente AS id,
-                c.categoria, c.nome, c.nome_coluna AS coluna, c.unidade,
-                cp.operador, cp.limite_atencao AS atencao, cp.limite_critico AS critico,
-                cp.operador_2 AS operador2, cp.limite_atencao_2 AS atencao2,
-                cp.limite_critico_2 AS critico2
-                FROM componentes_perfil cp JOIN componentes c ON c.id_componente = cp.fk_componente
-                ORDER BY cp.fk_perfil_servidor, c.categoria, c.ordem_card, c.id_componente""")
-            componentes = cursor.fetchall()
-            # busca usuarios ativos 
-            cursor.execute("SELECT id_usuario, fk_empresa FROM usuario WHERE status = 'ATIVO'")
-            usuarios = cursor.fetchall()
-
-            ## quais perfis que cada usuario pode visualizar 
-            cursor.execute("""SELECT u.id_usuario, p.id_perfil_servidor
-                FROM usuario u JOIN perfil_servidor p ON p.fk_empresa = u.fk_empresa
-                WHERE u.status = 'ATIVO' AND (
-                    EXISTS (SELECT 1 FROM nivel_acesso_permissoes np
-                        JOIN permissoes perm ON perm.id_permissao = np.fk_permissao
-                        WHERE np.fk_nivel_acesso = u.fk_nivel_acesso
-                        AND perm.nome IN ('ACESSAR_EQUIPE', 'ACESSAR_EMPRESAS'))
-                    OR EXISTS (SELECT 1 FROM usuario_perfil_servidor up
-                        WHERE up.fk_usuario = u.id_usuario
-                        AND up.fk_perfil_servidor = p.id_perfil_servidor))""")
-            acessos = cursor.fetchall()
-        #
-        for componente in componentes:
-            for campo, valor in componente.items():
-                if isinstance(valor, Decimal):
-                    componente[campo] = float(valor)
-        return perfis, servidores, componentes, usuarios, acessos
-    finally:
-        conexao.rollback()
-        conexao.close()
-
-
-#registra horarios em que cad servidor enviou informaçoes
-# Guarda só o horário da última captura de métricas; não repete sua classificação.
-def guardar_captura_perfis(banco, mac, campo, registro, agora):
-    horario = int(instante_utc(registro["timestamp"]).value // 1000000)
-    if horario > agora:
-        return
-    banco.execute("INSERT OR IGNORE INTO atividade_perfis VALUES (?, ?)", (mac, horario))
-    if campo == "metricas":
-        banco.execute("""INSERT INTO ultima_metrica_perfis VALUES (?, ?, NULL)
-            ON CONFLICT(mac) DO UPDATE SET instante=excluded.instante, critico=NULL
-            WHERE excluded.instante > ultima_metrica_perfis.instante""", (mac, horario))
-
-
-
-# Aqui só verificamos se alguma das métricas do servidor está crítica.
-def guardar_estado_perfil(banco, mac, data, resumos, agora):
-    #busca horario da ultima captura daquele servidor
-    ultima = banco.execute("SELECT instante FROM ultima_metrica_perfis WHERE mac = ?", (mac,)).fetchone()
-    if ultima is None:
-        return
-    #tranforma o horario da ultima captura em uma data
-    dia_ultima = pd.Timestamp(ultima[0], unit="ms", tz="UTC").tz_convert(FUSO_DIA).strftime("%Y-%m-%d")
-    if data != dia_ultima:
-        return
-    # O resumo original pode conter capturas futuras. Não usamos esse estado como atual.
-    if resumos.get("fim") and instante_utc(resumos["fim"]).value // 1000000 > agora:
-        return
-    estados = []
-
-    def ler_estado(leitura):
-        estado = leitura.get("tempo_no_estado", {}).get("estado_atual")
-        if estado in ("normal", "atencao", "critico"):
-            estados.append(estado)
-
-    for campo, conteudo in resumos.items():
-        if campo not in ("processos", "containers", "eventos", "logs", "extras"):
-            para_cada_medida(conteudo, ler_estado)
-            # se pelo menos uma metrica estiver critica retorna true
-    critico = None
-    if estados:
-        critico = "critico" in estados
-        #atualiza a tabela com o resultado
-    banco.execute("UPDATE ultima_metrica_perfis SET critico = ? WHERE mac = ?", (critico, mac))
-
-
-# Com 15 minutos completos sem captura, fica inativo.
-def servidor_ativo_perfil(banco, mac, referencia):
-    leitura = banco.execute("""SELECT MAX(instante) FROM atividade_perfis
-        WHERE mac = ? AND instante <= ?""", (mac, referencia)).fetchone()[0]
-    
-    if leitura is None:
-        return False
-
-    #calcula quanto tempo passou desde a ultima captura, se for menor que 15 minutos o servidor ainda é ativo
-    return referencia - leitura < INATIVIDADE_PERFIS_MS
-
-
-# Apenas lê o resultado já preparado pela Gold, sem comparar limites novamente.
-def servidor_critico_perfil(banco, mac, componentes, agora):
-    tem_limites = False
-    for componente in componentes:
-        if componente["critico"] is not None or componente["critico2"] is not None:
-            tem_limites = True
-    if not tem_limites:
-        return False
-    ultima = banco.execute("SELECT instante, critico FROM ultima_metrica_perfis WHERE mac = ?", (mac,)).fetchone()
-    if ultima is None or agora - ultima[0] >= INATIVIDADE_PERFIS_MS:
-        return None
-    if ultima[1] is None:
-        return None
-    return bool(ultima[1])
-
-
-# Calcula os resultados de um perfil, incluindo servidores que nunca enviaram dados.
-def resumir_perfil_dashboard(banco, perfil, servidores, componentes, agora):
-    #pega apenas os servidores vinculados ao perfil atual
-    grupo = [s for s in servidores if s["fk_perfil_servidor"] == perfil["id_perfil_servidor"]]
-   # faz o mesmo com componentes e limites
-    limites = [c for c in componentes if c["fk_perfil_servidor"] == perfil["id_perfil_servidor"]]
-    resumo = {
-        "id": perfil["id_perfil_servidor"], "nome": perfil["nome"],
-        "totalServidores": len(grupo), "limites": limites,
-        "ativos": 0, "inativos": 0, "criticos": 0, "percentualCriticos": 0
-    }
-    historico = {}
-    for minutos in PERIODOS_PERFIS:
-        referencia = agora - minutos * 60000
-        status = {"id": resumo["id"], "nome": resumo["nome"], "ativos": 0, "inativos": 0}
-        for servidor in grupo:
-            #grupo é a lista de servidores vinculados ao perfil.
-            mac = servidor["endereco_mac"].strip().upper().replace("-", ":")
-
-            #Verifica se o servidor estava ativo naquele horário do passado.
-            if servidor_ativo_perfil(banco, mac, referencia):
-                status["ativos"] += 1
-            else:
-                status["inativos"] += 1
-        historico[str(minutos)] = status
-    for servidor in grupo:
-        mac = servidor["endereco_mac"].strip().upper().replace("-", ":")
-
-        #calcula os atvos e inativos de agr
-        if not servidor_ativo_perfil(banco, mac, agora):
-            resumo["inativos"] += 1
-            continue
-        resumo["ativos"] += 1
-        critico = servidor_critico_perfil(banco, mac, limites, agora)
-        if critico is None:
-            resumo["criticos"] = None
-        elif critico and resumo["criticos"] is not None:
-            resumo["criticos"] += 1
-            #calcula o percentual
-    if resumo["criticos"] is None:
-        resumo["percentualCriticos"] = None
-    elif grupo:
-        resumo["percentualCriticos"] = round(resumo["criticos"] / len(grupo) * 100, 2)
-    return resumo, historico
-
-
-# Entrega os indicadores prontos. Cada usuário recebe só os perfis que pode consultar.
-# Assim o controller não precisa refazer contagens ao filtrar os resultados.
-
-
-def gerar_dashboard_perfis(banco, cadastros, agora):
-    perfis, servidores, componentes, usuarios, acessos = cadastros
-
-    calculados = {}
-    for perfil in perfis:
-        calculados[perfil["id_perfil_servidor"]] = resumir_perfil_dashboard(banco, perfil, servidores, componentes, agora)
-    #Cria uma lista de documentos e começa a preparar um documento para cada usuário.
-    documentos = []
-
-    for usuario in usuarios:
-        
-    #procura quais perfis o usuário pode visualizar
-        permitidos = {a["id_perfil_servidor"] for a in acessos if a["id_usuario"] == usuario["id_usuario"]}
-        resumos = []
-        historico = {}
-        for minutos in PERIODOS_PERFIS:
-            referencia = pd.Timestamp(agora - minutos * 60000, unit="ms", tz="UTC").isoformat()
-            historico[str(minutos)] = {"minutos": minutos, "referencia": referencia, "perfis": []}
-        for perfil in perfis:
-            #Pula o perfil se ele pertence a outra empresa ou se o usuário não pode visualizá-lo.
-            if perfil["fk_empresa"] != usuario["fk_empresa"] or perfil["id_perfil_servidor"] not in permitidos:
-                continue
-            resumo, status = calculados[perfil["id_perfil_servidor"]]
-            resumos.append(resumo)
-            for minutos in PERIODOS_PERFIS:
-                historico[str(minutos)]["perfis"].append(status[str(minutos)])
-        
-        #verifica se tem algum servidor vinculado naquele perfil
-        perfis_ativos = 0
-        #maior: maior quantidade de servidores críticos encontrada em um perfil
-        maior = 0
-        completos = True
-        for perfil in resumos:
-            #Se o perfil tem pelo menos um servidor vinculado, soma um à KPI
-            if perfil["totalServidores"] > 0:
-                perfis_ativos += 1
-
-            if perfil["criticos"] is None:
-                completos = False
-            else:
-                maior = max(maior, perfil["criticos"])
-        mais_criticos = None
-        if completos:
-            mais_criticos = []
-            for perfil in resumos:
-                if maior > 0 and perfil["criticos"] == maior:
-                    mais_criticos.append({"id": perfil["id"], "nome": perfil["nome"]})
-        ranking = [p for p in resumos if p["percentualCriticos"] is not None]
-        #Ordena do maior percentual para o menor. Se os percentuais forem iguais, usa o ID para desempatar.
-        #lambda perfil: significa “pegue um perfil e faça o que está depois dos dois-pontos”.
-        ranking.sort(key=lambda p: (-p["percentualCriticos"], p["id"]))
-        documentos.append({
-            "schema_version": 1, "empresaId": usuario["fk_empresa"], "usuarioId": usuario["id_usuario"],
-            "geradoEm": pd.Timestamp(agora, unit="ms", tz="UTC").isoformat(),
-            "validoAte": pd.Timestamp(agora + 10 * 60000, unit="ms", tz="UTC").isoformat(),
-            "coletasDisponiveis": True,
-            "avisos": [] if completos else ["Há servidores sem classificação de métricas na Gold."],
-            "kpis": {"perfisConfigurados": len(resumos), "perfisAtivos": perfis_ativos,
-                "perfisComMaisCriticos": mais_criticos},
-            "perfis": resumos, "rankingCriticos": ranking, "historicoStatus": historico
-        })
-    return documentos
-# endregion
-
-
 def processar_gold():
     print("Buscando lotes na Silver...")
     diarios = {}
@@ -777,25 +521,12 @@ def processar_gold():
     evolucoes = {}  # (mac, data) -> AcumuladorEvolucao, mesma ideia do tempos_no_estado
     tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
-    
-    # Dashboard por perfil: busca os vínculos e limites cadastrados uma vez.
-    cadastros_perfis = None
-    agora_perfis = int(pd.Timestamp.now(tz="UTC").value // 1000000)
-    if os.environ.get("CORETRACE_PERFIS_ENABLED") == "1":
-        cadastros_perfis = buscar_cadastros_perfis()
-
 
     # O arquivo de IDs evita guardar milhões de identificadores na RAM
     with TemporaryDirectory(prefix="coretrace-gold-") as temporaria:
         pasta = Path(temporaria)
         with closing(sqlite3.connect(pasta / "ids.sqlite")) as vistos:
             vistos.execute("CREATE TABLE vistos (id TEXT PRIMARY KEY) WITHOUT ROWID")
-  
-            # Dashboard por perfil: guarda horários e estados só durante esta execução.
-            if cadastros_perfis is not None:
-                vistos.execute("CREATE TABLE atividade_perfis (mac TEXT, instante INTEGER, PRIMARY KEY(mac, instante)) WITHOUT ROWID")
-                vistos.execute("CREATE TABLE ultima_metrica_perfis (mac TEXT PRIMARY KEY, instante INTEGER, critico INTEGER) WITHOUT ROWID")
-            
             # Guarda as mensagens em disco até montar o resumo de cada máquina/dia.
             vistos.execute(
                 "CREATE TABLE logs_diarios (mac TEXT, dia TEXT, instante INTEGER, "
@@ -887,11 +618,6 @@ def processar_gold():
                                     (registro["id_captura"],)
                                 )
                                 if consulta.rowcount == 1:
-                                   
-                                    # Dashboard por perfil: aproveita a captura que já foi lida.
-                                    if cadastros_perfis is not None:
-                                        guardar_captura_perfis(vistos, mac, campo, registro, agora_perfis)
-                          
                                     if campo == "logs":
                                         vistos.execute(
                                             "INSERT INTO logs_diarios VALUES (?, ?, ?, ?, ?)",
@@ -952,11 +678,6 @@ def processar_gold():
                 # antes disso - nao precisa de nenhuma chamada nova a API.
                 severidade = calcular_severidade(resumos)
 
-                # Dashboard por perfil: usa as classificações prontas em tempo_no_estado.
-                if cadastros_perfis is not None:
-                    guardar_estado_perfil(vistos, mac, data, resumos, agora_perfis)
-
-
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",
                     "endereco_mac": mac, "data": data, "resumos": resumos,
@@ -981,14 +702,6 @@ def processar_gold():
                 diario["lotes_atuais"] = referencias
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
                 preparar_envio(pasta, envios, destino, diario)
-
-          
-            # Dashboard por perfil: junta os indicadores e prepara o JSON para o site.
-            if cadastros_perfis is not None:
-                for documento in gerar_dashboard_perfis(vistos, cadastros_perfis, agora_perfis):
-                    destino = f"{GOLD}perfis/empresa={documento['empresaId']}/usuario={documento['usuarioId']}/dashboard.json"
-                    preparar_envio(pasta, envios, destino, documento)
-
 
         # Só chegamos aqui se todos os documentos foram preparados sem erro
         # A pasta temporária é apagada automaticamente no final, inclusive se o envio falhar
