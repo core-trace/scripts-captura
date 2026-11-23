@@ -452,26 +452,33 @@ def organizar_metricas(registro):
 # Nome/PID/usuário identificam a observação, mas não provam que o processo continua ativo.
 # CPU de processo pode passar de 100% e não recebe o limite da CPU total do host.
 def organizar_processo(registro):
-    usados = {'TIMESTAMP', 
-                'ENDERECO_MAC', 
-                'PID', 
-                'NOME', 
-                'USUARIO', 
-                'CREATE_TIME', 
-                'NUM_THREADS', 
-                'RSS_BYTES', 
-                'STATUS'}
-    resultado = {'timestamp': registro['TIMESTAMP'], 
-                'pid': int(registro['PID']),
-                'nome': registro['NOME'], 
-                'usuario': registro.get('USUARIO'), 
-                'create_time': registro.get('CREATE_TIME'),
-                'status_processo': registro.get('STATUS'),
-                'escopo': 'processo'}
+    usados = {
+        'TIMESTAMP', 
+        'ENDERECO_MAC', 
+        'PID', 
+        'NOME', 
+        'USUARIO', 
+        'CREATE_TIME', 
+        'NUM_THREADS', 
+        'RSS_BYTES', 
+        'STATUS'}
+    
+    resultado = {
+        'timestamp': registro['TIMESTAMP'], 
+        'pid': int(registro['PID']),
+        'nome': registro['NOME'], 
+        'usuario': registro.get('USUARIO'), 
+        'create_time': registro.get('CREATE_TIME'),
+        'status_processo': registro.get('STATUS'),
+        'escopo': 'processo'
+    }
+    
     for grupo, campos in [
         ('cpu', {'uso': ('CPU_PERCENT', None, '%', 'medicao')}),
-        ('memoria', {'uso_percentual': ('MEMORIA_PERCENT', None, '%', 'medicao'),
-                     'rss': ('RSS_BYTES',None,'bytes','medicao')}),
+        ('memoria', {
+            'uso_percentual': ('MEMORIA_PERCENT', None, '%', 'medicao'),
+            'rss': ('RSS_BYTES',None,'bytes','medicao')}
+        ),
         ('threads', {'quantidade' : ('NUM_THREADS',None,'threads','medicao')})
     ]:
         medidas = organizar_campos(registro, campos, usados, percentual_limitado=False)
