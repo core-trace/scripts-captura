@@ -9,11 +9,12 @@ import hashlib
 import sqlite3
 import math
 import requests
+from silver import processar_arquivos as processar_silver
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, AcumuladorEstadoRecursos, AcumuladorPrevisao, calcular_severidade, piores_recursos, estado_por_categoria
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -21,7 +22,8 @@ from formato_gold import (
     organizar_evento,
     organizar_log,
     resumir_documento,
-    para_cada_medida
+    para_cada_medida,
+    para_cada_medida_com_recurso
 )
 
 BUCKET = "bucket-coretrace"
@@ -517,6 +519,9 @@ def processar_gold():
     diarios = {}
     lotes_atuais = {}
     tempos_no_estado = {}  # (mac, data) -> AcumuladorTempoNoEstado, em paralelo aos "diarios"
+    evolucoes = {}  # (mac, data) -> AcumuladorEvolucao, mesma ideia do tempos_no_estado
+    estados_recursos = {}  # (mac, data) -> AcumuladorEstadoRecursos, estado por núcleo/volume/interface
+    previsoes = {}  # (mac, data) -> AcumuladorPrevisao, mesma ideia tambem
     tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
 
@@ -525,6 +530,12 @@ def processar_gold():
         pasta = Path(temporaria)
         with closing(sqlite3.connect(pasta / "ids.sqlite")) as vistos:
             vistos.execute("CREATE TABLE vistos (id TEXT PRIMARY KEY) WITHOUT ROWID")
+            # Guarda as mensagens em disco até montar o resumo de cada máquina/dia.
+            vistos.execute(
+                "CREATE TABLE logs_diarios (mac TEXT, dia TEXT, instante INTEGER, "
+                "id TEXT PRIMARY KEY, registro TEXT)"
+            )
+            vistos.execute("CREATE INDEX logs_por_dia ON logs_diarios (mac, dia, instante, id)")
             paginador = s3.get_paginator("list_objects_v2")
             paginas = paginador.paginate(Bucket=BUCKET, Prefix=SILVER)
 
@@ -586,8 +597,14 @@ def processar_gold():
                                 diarios[chave_dia] = AcumuladorResumo()
                                 lotes_atuais[chave_dia] = []
                                 tempos_no_estado[chave_dia] = AcumuladorTempoNoEstado()
+                                evolucoes[chave_dia] = AcumuladorEvolucao()
+                                estados_recursos[chave_dia] = AcumuladorEstadoRecursos()
+                                previsoes[chave_dia] = AcumuladorPrevisao()
                             acumulador = diarios[chave_dia]
                             acumulador_tempo = tempos_no_estado[chave_dia]
+                            acumulador_evolucao = evolucoes[chave_dia]
+                            acumulador_recursos = estados_recursos[chave_dia]
+                            acumulador_previsao = previsoes[chave_dia]
                             lotes_atuais[chave_dia].append({
                                 "lote_id": lote_id, "chave": destino, "origem": lote["origem"]
                             })
@@ -608,23 +625,43 @@ def processar_gold():
                                     (registro["id_captura"],)
                                 )
                                 if consulta.rowcount == 1:
+                                    if campo == "logs":
+                                        vistos.execute(
+                                            "INSERT INTO logs_diarios VALUES (?, ?, ?, ?, ?)",
+                                            (mac, data, pd.Timestamp(registro["timestamp"]).value,
+                                             registro["id_captura"],
+                                             json.dumps(registro, ensure_ascii=False, allow_nan=False))
+                                        )
                                     observacao = novo_documento(mac, data)
                                     observacao[campo] = [registro]
                                     resumo = resumir_documento(observacao)
                                     acumulador.adicionar(resumo, registro["timestamp"])
 
-                                    # "Tempo no estado" precisa das leituras cruas, na ordem do
-                                    # tempo - por isso alimentamos um acumulador separado aqui,
-                                    # em vez de tentar extrair isso do resumo já combinado acima.
+                                    # tempo no estado e evolucao real precisam das leituras cruas,
+                                    # nao do resumo ja combinado la em cima, entao alimento os dois
+                                    # acumuladores aqui mesmo, na mesma passada
                                     if campo == "metricas":
                                         instante = registro["timestamp"]
-                                        para_cada_medida(
-                                            registro,
-                                            lambda leitura: acumulador_tempo.adicionar(
-                                                leitura.get("metrica"), instante,
-                                                leitura.get("valor"), leitura.get("status")
+
+                                        def _alimentar_leitura(leitura):
+                                            metrica = leitura.get("metrica")
+                                            valor = leitura.get("valor")
+                                            status = leitura.get("status")
+                                            acumulador_tempo.adicionar(metrica, instante, valor, status)
+                                            acumulador_evolucao.adicionar(metrica, instante, valor, status)
+                                            acumulador_previsao.adicionar(metrica, instante, valor, status)
+
+                                        para_cada_medida(registro, _alimentar_leitura)
+                                        # estado por recurso (núcleo, volume, interface) e horário da captura, pra dashboard do Marcelo
+                                        def _alimentar_recurso(leitura, categoria, recurso):
+                                            acumulador_recursos.adicionar(
+                                                categoria, recurso, leitura.get("metrica"), instante,
+                                                leitura.get("valor"), leitura.get("status"),
+                                                leitura.get("unidade"), leitura.get("tipo")
                                             )
-                                        )
+
+                                        para_cada_medida_com_recurso(registro, _alimentar_recurso)
+                                        acumulador_recursos.registrar_captura(instante)
                     except Exception as erro:
                         raise ValueError(f"Falha em {chave}: {erro}") from erro
 
@@ -636,6 +673,7 @@ def processar_gold():
                 referencias = sorted(lotes_atuais[(mac, data)], key=chave_do_lote)
                 resumos = acumulador.resultado()
 
+                evolucao = None
                 tokens = tokens_por_mac.get(mac)
                 if tokens is not None:
                     if tokens not in cache_limites:
@@ -651,11 +689,64 @@ def processar_gold():
                                     leitura["tempo_no_estado"] = tempo
                             para_cada_medida(resumos, _injetar_tempo_no_estado)
 
+                        evolucao = evolucoes[(mac, data)].calcular(limites_por_metrica)
+
+                        previsao_por_metrica = previsoes[(mac, data)].calcular(limites_por_metrica)
+                        if previsao_por_metrica:
+                            def _injetar_previsao(leitura):
+                                previsao = previsao_por_metrica.get(leitura.get("metrica"))
+                                if previsao is not None:
+                                    leitura["previsao_limite"] = previsao
+                            para_cada_medida(resumos, _injetar_previsao)
+
+                # A severidade usa o que acabamos de calcular acima (tempo_por_metrica
+                # ja injetado em "resumos"), mais a contagem de OOM que o resumo ja tinha
+                # antes disso - nao precisa de nenhuma chamada nova a API.
+                severidade = calcular_severidade(resumos)
+                # Estado de cada recurso (núcleo, volume, interface...) com valor atual e desde quando.
+                # Reaproveita a consulta de limites feita acima (cache_limites), sem nova chamada à API.
+                limites_estado = None
+                if tokens is not None:
+                    limites_estado = cache_limites.get(tokens)
+                estado_recursos = estados_recursos[(mac, data)].calcular(limites_estado)
+
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",
                     "endereco_mac": mac, "data": data, "resumos": resumos,
-                    "lotes_atuais": referencias
+                    # Mesmo formato dos lotes; as contagens continuam em resumos.logs.
+                    "logs": [
+                        json.loads(registro)
+                        for (registro,) in vistos.execute(
+                            "SELECT registro FROM logs_diarios WHERE mac = ? AND dia = ? "
+                            "ORDER BY instante, id", (mac, data)
+                        )
+                    ]
                 }
+                # Omitimos a chave inteira (em vez de usar None) quando nao deu pra calcular -
+                # mesma convencao do tempo_no_estado em cada metrica.
+                if severidade is not None:
+                    diario["severidade"] = severidade
+                # evolucao vem vazia (lista []) quando nenhuma leitura bateu com algum
+                # limite configurado - mesmo "nao tem o que calcular" do severidade, so
+                # que aqui o "vazio" e uma lista, nao None
+                if evolucao:
+                    diario["evolucao"] = evolucao
+                diario["lotes_atuais"] = referencias
+                # Campos extras pro consumo da dashboard do Marcelo. O que já existia no resumo não muda.
+                # Mesma convenção dos outros: omitimos a chave quando não deu pra calcular.
+                diario["gerado_em"] = pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
+                # False quando a API de limites não respondeu: quem lê não deve tratar a falta de estado como "normal".
+                diario["classificacao_disponivel"] = limites_estado is not None
+                ultima_coleta = estados_recursos[(mac, data)].ultima_coleta_iso()
+                if ultima_coleta is not None:
+                    diario["ultima_coleta"] = ultima_coleta
+                ultimo_oom = estados_recursos[(mac, data)].ultimo_oom_iso()
+                if ultimo_oom is not None:
+                    diario["ultimo_oom_em"] = ultimo_oom
+                if estado_recursos:
+                    diario["recursos_estado"] = estado_recursos
+                    diario["piores_recursos"] = piores_recursos(estado_recursos)
+                    diario["estado_por_categoria"] = estado_por_categoria(estado_recursos)
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
                 preparar_envio(pasta, envios, destino, diario)
 
@@ -667,6 +758,17 @@ def processar_gold():
             print("Arquivo JSON enviado para:", destino)
     print("Processamento Gold finalizado!")
 
+def lambda_handler(event, context):
+    print("=== Etapa 1: Processando camada Silver (raw/ -> trusted/) ===")
+    processar_silver()
+
+    print("=== Etapa 2: Processando camada Gold (trusted/ -> client/) ===")
+    processar_gold()
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps("Pipeline Silver + Gold finalizado com sucesso!")
+    }
 
 if __name__ == "__main__":
 
@@ -684,3 +786,6 @@ if __name__ == "__main__":
 
         print("Aguardando 5 minutos...")
         time.sleep(300)
+
+
+    

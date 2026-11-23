@@ -453,6 +453,13 @@ def processar_arquivos():
 
     print("\nTratamento finalizado!")
 
+def lambda_handler(event, context):
+    processar_arquivos()
+    return {
+        "statusCode": 200,
+        "body": "Tratamento Silver finalizado com sucesso!"
+    }
+
 
 if __name__ == "__main__":
 

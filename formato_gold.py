@@ -738,6 +738,62 @@ def para_cada_medida(estrutura, funcao):
             para_cada_medida(item, funcao)
 
 
+# Categorias do servidor que a dashboard do Marcelo acompanha. Processos, containers,
+# eventos e logs ficam de fora: são outro escopo e outra persona.
+CATEGORIAS_SERVIDOR = ('cpu', 'ram', 'swap', 'carga', 'disco', 'rede')
+
+
+# Descobre se o dicionário é um recurso físico: volume, dispositivo de I/O, interface de
+# rede ou núcleo da CPU. É a mesma identidade que o identidade_recurso usa nos resumos.
+def identificar_recurso(item, categoria):
+    if 'montagem' in item:
+        return {'tipo': 'volume', 'identificador': item['montagem'],
+                'descricao': f"volume {item['montagem']}"}
+
+    if 'dispositivo' in item:
+        return {'tipo': 'dispositivo', 'identificador': item['dispositivo'],
+                'descricao': f"dispositivo {item['dispositivo']}"}
+
+    if categoria == 'rede' and 'nome' in item:
+        return {'tipo': 'interface', 'identificador': item['nome'],
+                'descricao': f"interface {item['nome']}"}
+
+    # O índice só identifica o recurso na CPU. Nos volumes ele é só a posição na lista.
+    if categoria == 'cpu' and 'indice' in item:
+        return {'tipo': 'nucleo', 'identificador': item['indice'],
+                'descricao': f"núcleo {item['indice']}"}
+
+    return None
+
+
+# Igual ao para_cada_medida, mas a função também recebe a categoria (cpu, ram, disco...)
+# e o recurso em que a medida está (núcleo 3, volume /, interface eth0). Sem isso a
+# identidade se perde e todos os núcleos/volumes/interfaces viram uma série só.
+# A função recebe (medida, categoria, recurso); recurso é None quando a medida é do
+# servidor inteiro, como cpu total e ram.
+def para_cada_medida_com_recurso(estrutura, funcao, categoria=None, recurso=None):
+    if isinstance(estrutura, dict):
+        if categoria is not None:
+            identificado = identificar_recurso(estrutura, categoria)
+            if identificado is not None:
+                recurso = identificado
+
+            if 'metrica' in estrutura and 'tipo' in estrutura:
+                funcao(estrutura, categoria, recurso)
+
+        for campo, valor in estrutura.items():
+            if categoria is None:
+                # No topo da captura só entramos nas categorias do servidor.
+                if campo in CATEGORIAS_SERVIDOR:
+                    para_cada_medida_com_recurso(valor, funcao, campo, None)
+            else:
+                para_cada_medida_com_recurso(valor, funcao, categoria, recurso)
+
+    elif isinstance(estrutura, list):
+        for item in estrutura:
+            para_cada_medida_com_recurso(item, funcao, categoria, recurso)
+
+
 def resumir_estrutura(observacoes):
     # Percorre o conteúdo até chegar numa medida com valor/status.
     # Quando encontra uma lista, primeiro separa os recursos pra não misturar seus históricos.

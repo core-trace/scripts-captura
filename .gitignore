@@ -1,5 +1,6 @@
 docs
-tests
+tests/*
+!tests/test_gold_logs.py
 .venv
 __pycache__/
 __init__.py
