@@ -1,5 +1,7 @@
 import psutil as p
+
 from utils.coleta import numero_valido, salvar_leitura
+
 
 COLUNAS_PROCESSOS = [
     "TIMESTAMP",
@@ -10,7 +12,6 @@ COLUNAS_PROCESSOS = [
     "P_MEMORIA_PERCENT",
     "P_CPU_PERCENT_STATUS",
     "P_MEMORIA_PERCENT_STATUS",
-    
 ]
 
 ATRIBUTOS = [
@@ -22,12 +23,18 @@ ATRIBUTOS = [
 ]
 
 IDS_PROCESSOS = [
-    "p_cpu_porcent",
-    "p_memory_porcent"
+    "p_cpu_percent",
+    "p_memory_percent",
 ]
 
 # Estado usado quando chamamos com a assinatura antiga.
 _ESTADO = {"aquecidos": {}, "limite": 50}
+
+
+def salvar_leitura_processo(dados, coluna, valor, status="ok"):
+    # salvar_leitura grava "<coluna>_status"; o CSV de processos usa "_STATUS".
+    salvar_leitura(dados, coluna, valor, status)
+    dados[coluna + "_STATUS"] = dados.pop(coluna + "_status")
 
 
 def preparar_coleta_processos(selecionadas=None, limite=50):
@@ -40,7 +47,7 @@ def preparar_coleta_processos(selecionadas=None, limite=50):
 
 
 def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
-    # [REAPROVEITADO] a assinatura antiga continua funcionando.
+    # A assinatura antiga continua funcionando.
     estado = estado if estado is not None else _ESTADO
     estado["limite"] = limite
 
@@ -48,7 +55,6 @@ def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
     pids_vistos = set()
     aquecidos = estado["aquecidos"]
 
-    # [REAPROVEITADO] o mesmo process_iter(ATRIBUTOS) de antes.
     for proc in p.process_iter(ATRIBUTOS):
         try:
             info = proc.info
@@ -64,7 +70,6 @@ def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
             if nome is None or not str(nome).strip():
                 continue
 
-            # [REAPROVEITADO] montagem original da linha.
             linha = {
                 "TIMESTAMP": timestamp,
                 "ENDERECO_MAC": endereco_mac,
@@ -78,34 +83,33 @@ def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
             valor_cpu = info.get("cpu_percent")
 
             if not ja_aquecido:
-                # 1ª leitura do psutil só cria a referência.
-                salvar_leitura(
+                # A 1ª leitura do psutil só cria a referência.
+                salvar_leitura_processo(
                     linha, "P_CPU_PERCENT", valor_cpu, "aquecendo"
                 )
             elif numero_valido(valor_cpu) and valor_cpu >= 0:
                 # CPU de processo pode passar de 100% em multinúcleo.
-                salvar_leitura(
+                salvar_leitura_processo(
                     linha, "P_CPU_PERCENT", round(valor_cpu, 2)
                 )
             else:
-                salvar_leitura(
+                salvar_leitura_processo(
                     linha, "P_CPU_PERCENT", None, "indisponivel"
                 )
 
             valor_memoria = info.get("memory_percent")
             if numero_valido(valor_memoria) and 0 <= valor_memoria <= 100:
-                salvar_leitura(
+                salvar_leitura_processo(
                     linha, "P_MEMORIA_PERCENT", round(valor_memoria, 2)
                 )
             else:
-                salvar_leitura(
+                salvar_leitura_processo(
                     linha, "P_MEMORIA_PERCENT", None, "indisponivel"
                 )
 
             aquecidos[pid] = create_time
             linhas.append(linha)
 
-        # [REAPROVEITADO] mesmas exceções de antes.
         except (p.NoSuchProcess, p.AccessDenied, p.ZombieProcess):
             continue
 
@@ -114,8 +118,7 @@ def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
         if pid not in pids_vistos:
             del aquecidos[pid]
 
-    # [REAPROVEITADO] mesma ideia de ordenar e limitar.
-    # [AJUSTE] a chave agora é P_CPU_PERCENT.
+    # Aquecidos/mais pesados primeiro; PID menor desempata.
     linhas.sort(
         key=lambda linha: (
             linha["P_CPU_PERCENT"]
@@ -128,4 +131,3 @@ def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
     )
 
     return linhas[:estado["limite"]]
-

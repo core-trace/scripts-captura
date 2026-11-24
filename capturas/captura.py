@@ -370,7 +370,7 @@ def capturar_dados(
 
     for metrica in metricas:
         coluna = metrica["nome_coluna"]
-        if coluna in IDS_CPU or coluna in IDS_RAM or coluna in IDS_DISCO or coluna in IDS_SWAP or coluna in IDS_CARGA or coluna in IDS_REDE:
+        if coluna in IDS_CPU or coluna in IDS_RAM or coluna in IDS_DISCO or coluna in IDS_SWAP or coluna in IDS_CARGA or coluna in IDS_REDE or coluna in IDS_PROCESSOS:
             continue
 
         dados[coluna] = capturar_metrica(
@@ -464,7 +464,7 @@ def main():
     estado_swap = preparar_coleta_swap(escolhas_metricas)
     estado_carga = preparar_coleta_carga(escolhas_metricas)
     estado_rede = preparar_coleta_rede(escolhas_metricas)
-    estado_procesos = preparar_coleta_processos(escolhas_metricas)
+    estado_processos = preparar_coleta_processos(escolhas_metricas)
 
     colunas = [
         "TIMESTAMP",
@@ -482,6 +482,7 @@ def main():
         and metrica["nome_coluna"] not in IDS_SWAP
         and metrica["nome_coluna"] not in IDS_CARGA
         and metrica["nome_coluna"] not in IDS_REDE
+        and metrica["nome_coluna"] not in IDS_PROCESSOS
     )
     colunas.extend(colunas_cpu(estado_cpu))
     colunas.extend(colunas_ram(estado_ram))

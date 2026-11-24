@@ -466,7 +466,7 @@ def organizar_processo(registro):
         'escopo': 'processo'
     }
     
-     colunas = {
+    colunas = {
         'cpu': next(
             (c for c in ('P_CPU_PERCENT', 'CPU_PERCENT') if c in registro),
             None
