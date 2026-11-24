@@ -1,50 +1,131 @@
-import psutil
-from datetime import datetime
+import psutil as p
+from utils.coleta import numero_valido, salvar_leitura
 
 COLUNAS_PROCESSOS = [
     "TIMESTAMP",
     "ENDERECO_MAC",
     "PID",
     "NOME",
-    "USUARIO",
     "P_CPU_PERCENT",
     "P_MEMORIA_PERCENT",
-    "STATUS"
+    "P_CPU_PERCENT_STATUS",
+    "P_MEMORIA_PERCENT_STATUS",
     
 ]
 
-ATRIBUTOS = ["pid", "name", "username", "p_cpu_percent", "p_memory_percent"]
+ATRIBUTOS = [
+    "pid",
+    "name",
+    "cpu_percent",
+    "memory_percent",
+    "create_time",
+]
+
+IDS_PROCESSOS = [
+    "p_cpu_porcent",
+    "p_memory_porcent"
+]
+
+# Estado usado quando chamamos com a assinatura antiga.
+_ESTADO = {"aquecidos": {}, "limite": 50}
 
 
-def coletar_processos(timestamp, endereco_mac, limite=50):
+def preparar_coleta_processos(selecionadas=None, limite=50):
+    """Cria o estado de aquecimento por PID, como em cpu/ram.
+
+    `selecionadas` é aceito só para manter a mesma assinatura das outras
+    capturas; aqui as duas métricas sempre são coletadas.
+    """
+    return {"aquecidos": {}, "limite": limite}
+
+
+def coletar_processos(timestamp, endereco_mac, limite=50, estado=None):
+    # [REAPROVEITADO] a assinatura antiga continua funcionando.
+    estado = estado if estado is not None else _ESTADO
+    estado["limite"] = limite
+
     linhas = []
+    pids_vistos = set()
+    aquecidos = estado["aquecidos"]
 
-    # process_iter reaproveita os objetos entre as chamadas, então o cpu_percent
-    # só fica válido a partir da 2ª rodada (na 1ª vem 0.0)
-    for proc in psutil.process_iter(ATRIBUTOS):
+    # [REAPROVEITADO] o mesmo process_iter(ATRIBUTOS) de antes.
+    for proc in p.process_iter(ATRIBUTOS):
         try:
             info = proc.info
-            mem = info.get("memory_info")
-            rss_bytes = mem.rss if mem else None;
-
+            pid = info.get("pid")
+            nome = info.get("name")
             create_time = info.get("create_time")
-            if create_time is not None:
-                create_time = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S")
 
-            linhas.append({
+            if pid is None:
+                continue
+
+            pids_vistos.add(pid)
+
+            if nome is None or not str(nome).strip():
+                continue
+
+            # [REAPROVEITADO] montagem original da linha.
+            linha = {
                 "TIMESTAMP": timestamp,
                 "ENDERECO_MAC": endereco_mac,
-                "PID": info["pid"],
-                "NOME": info["name"],
-                "USUARIO": info.get("username"),
-                "P_CPU_PERCENT": info["cpu_percent"],
-                "P_MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2)
-            })
+                "PID": pid,
+                "NOME": nome,
+            }
 
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            ja_aquecido = (
+                pid in aquecidos and aquecidos[pid] == create_time
+            )
+            valor_cpu = info.get("cpu_percent")
+
+            if not ja_aquecido:
+                # 1ª leitura do psutil só cria a referência.
+                salvar_leitura(
+                    linha, "P_CPU_PERCENT", valor_cpu, "aquecendo"
+                )
+            elif numero_valido(valor_cpu) and valor_cpu >= 0:
+                # CPU de processo pode passar de 100% em multinúcleo.
+                salvar_leitura(
+                    linha, "P_CPU_PERCENT", round(valor_cpu, 2)
+                )
+            else:
+                salvar_leitura(
+                    linha, "P_CPU_PERCENT", None, "indisponivel"
+                )
+
+            valor_memoria = info.get("memory_percent")
+            if numero_valido(valor_memoria) and 0 <= valor_memoria <= 100:
+                salvar_leitura(
+                    linha, "P_MEMORIA_PERCENT", round(valor_memoria, 2)
+                )
+            else:
+                salvar_leitura(
+                    linha, "P_MEMORIA_PERCENT", None, "indisponivel"
+                )
+
+            aquecidos[pid] = create_time
+            linhas.append(linha)
+
+        # [REAPROVEITADO] mesmas exceções de antes.
+        except (p.NoSuchProcess, p.AccessDenied, p.ZombieProcess):
             continue
 
-    # Grava só os N mais pesados, senão seriam centenas de linhas por segundo
-    linhas.sort(key=lambda linha: linha["CPU_PERCENT"] or 0, reverse=True)
+    # Não guarda estado de processos que já saíram.
+    for pid in list(aquecidos):
+        if pid not in pids_vistos:
+            del aquecidos[pid]
 
-    return linhas[:limite]
+    # [REAPROVEITADO] mesma ideia de ordenar e limitar.
+    # [AJUSTE] a chave agora é P_CPU_PERCENT.
+    linhas.sort(
+        key=lambda linha: (
+            linha["P_CPU_PERCENT"]
+            if numero_valido(linha["P_CPU_PERCENT"]) else -1,
+            linha["P_MEMORIA_PERCENT"]
+            if numero_valido(linha["P_MEMORIA_PERCENT"]) else -1,
+            -linha["PID"],
+        ),
+        reverse=True,
+    )
+
+    return linhas[:estado["limite"]]
+

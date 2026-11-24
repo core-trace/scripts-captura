@@ -8,10 +8,11 @@ import io
 from datetime import datetime
 from pathlib import Path
 from processos.processos import (
+    COLUNAS_PROCESSOS,
     IDS_PROCESSOS,
+    coletar_processos,
     preparar_coleta_processos,
-    colunas_processos,
-    coletar_processos,)
+)
 
 
 # A coleta de cada categoria tá no arquivo próprio
@@ -463,6 +464,7 @@ def main():
     estado_swap = preparar_coleta_swap(escolhas_metricas)
     estado_carga = preparar_coleta_carga(escolhas_metricas)
     estado_rede = preparar_coleta_rede(escolhas_metricas)
+    estado_procesos = preparar_coleta_processos(escolhas_metricas)
 
     colunas = [
         "TIMESTAMP",
@@ -523,7 +525,8 @@ def main():
             escritor_processos.writerows(
                 coletar_processos(
                     dados["TIMESTAMP"],
-                    endereco_mac
+                    endereco_mac,
+                    estado=estado_processos
                 )
             )
 

@@ -266,7 +266,7 @@ def organizar_campos(registro, campos, usados, prefixo='', percentual_limitado=T
         coluna = prefixo + campo
         if coluna in registro:
             limitar = True
-            if campo == 'CPU_PERCENT':
+            if campo in ('CPU_PERCENT','P_CPU_PERCENT'):
                 # CPU de processo/container pode passar de 100%, diferente da CPU total do host.
                 limitar = percentual_limitado
             resultado[nome] = leitura(registro, coluna, unidade, metrica, tipo, limitar)
@@ -457,33 +457,42 @@ def organizar_processo(registro):
         'ENDERECO_MAC', 
         'PID', 
         'NOME', 
-        'USUARIO', 
-        'CREATE_TIME', 
-        'NUM_THREADS', 
-        'RSS_BYTES', 
-        'STATUS'}
+    }
     
     resultado = {
         'timestamp': registro['TIMESTAMP'], 
         'pid': int(registro['PID']),
         'nome': registro['NOME'], 
-        'usuario': registro.get('USUARIO'), 
-        'create_time': registro.get('CREATE_TIME'),
-        'status_processo': registro.get('STATUS'),
         'escopo': 'processo'
     }
     
-    for grupo, campos in [
-        ('cpu', {'uso': ('CPU_PERCENT', None, '%', 'medicao')}),
-        ('memoria', {
-            'uso_percentual': ('MEMORIA_PERCENT', None, '%', 'medicao'),
-            'rss': ('RSS_BYTES',None,'bytes','medicao')}
+     colunas = {
+        'cpu': next(
+            (c for c in ('P_CPU_PERCENT', 'CPU_PERCENT') if c in registro),
+            None
         ),
-        ('threads', {'quantidade' : ('NUM_THREADS',None,'threads','medicao')})
-    ]:
-        medidas = organizar_campos(registro, campos, usados, percentual_limitado=False)
+        'memoria': next(
+            (c for c in ('P_MEMORIA_PERCENT', 'MEMORIA_PERCENT') if c in registro),
+            None
+        ),
+    }
+
+    for grupo, coluna, nome in (
+        ('cpu', colunas['cpu'], 'uso'),
+        ('memoria', colunas['memoria'], 'uso_percentual'),
+    ):
+        if coluna is None:
+            continue
+
+        medidas = organizar_campos(
+            registro,
+            {nome: (coluna, None, '%', 'medicao')},
+            usados,
+            percentual_limitado=False
+        )
         if medidas:
             resultado[grupo] = medidas
+
     restantes = extras(registro, usados)
     if restantes:
         resultado['extras'] = restantes
@@ -706,7 +715,7 @@ def identidade_recurso(item):
         return ('container', item['container_id'])
 
     if 'pid' in item:
-        return ('processo', item['pid'], item.get('nome'), item.get('usuario'))
+        return ('processo', item['pid'], item.get('nome'))
 
     if 'montagem' in item:
         return ('volume', item['montagem'], item.get('dispositivo'), item.get('tipo_sistema'))

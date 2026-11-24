@@ -268,7 +268,7 @@ def transformar_dados(df, tipo_arquivo):
 
             if not (
                 tipo_arquivo in ("processos", "docker_metricas")
-                and coluna.lower() == "cpu_percent"    
+                and coluna.lower() in ("cpu_percent", "p_cpu_percent")    
             ):
                 numeros = numeros.mask(numeros > 100)
 
