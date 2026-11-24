@@ -7,12 +7,10 @@ COLUNAS_PROCESSOS = [
     "PID",
     "NOME",
     "USUARIO",
-    "CPU_PERCENT",
-    "MEMORIA_PERCENT",
-    "RSS_BYTES",
-    "NUM_THREADS",
-    "CREATE_TIME",
-    "STATUS",
+    "P_CPU_PERCENT",
+    "P_MEMORIA_PERCENT",
+    "STATUS"
+    
 ]
 
 ATRIBUTOS = ["pid", "name", "username", "cpu_percent", "memory_percent","memory_info","num_threads","create_time","status"]

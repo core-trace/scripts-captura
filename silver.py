@@ -363,7 +363,7 @@ def processar_arquivos():
 
                 tipo_arquivo = identificar_tipo(df)
 
-                # Relaciona cada tipo de arquivo à sua pasta na Silver.
+                # Relaciona cada tipo de arquivo à suncias ↓a pasta na Silver.
                 # Mantemos as pastas antigas e separamos os dados do Docker.
                 pastas_destino = {
                     "metricas": "metricas",
