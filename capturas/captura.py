@@ -7,7 +7,11 @@ import requests
 import io
 from datetime import datetime
 from pathlib import Path
-from processos.processos import coletar_processos, COLUNAS_PROCESSOS
+from processos.processos import (
+    IDS_PROCESSOS,
+    preparar_coleta_processos,
+    colunas_processos,
+    coletar_processos,)
 
 
 # A coleta de cada categoria tá no arquivo próprio

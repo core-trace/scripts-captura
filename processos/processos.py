@@ -13,7 +13,7 @@ COLUNAS_PROCESSOS = [
     
 ]
 
-ATRIBUTOS = ["pid", "name", "username", "cpu_percent", "memory_percent","memory_info","num_threads","create_time","status"]
+ATRIBUTOS = ["pid", "name", "username", "p_cpu_percent", "p_memory_percent"]
 
 
 def coletar_processos(timestamp, endereco_mac, limite=50):
@@ -37,18 +37,14 @@ def coletar_processos(timestamp, endereco_mac, limite=50):
                 "PID": info["pid"],
                 "NOME": info["name"],
                 "USUARIO": info.get("username"),
-                "CPU_PERCENT": info["cpu_percent"],
-                "MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2),
-                "RSS_BYTES": rss_bytes,
-                "NUM_THREADS": info["num_threads"],
-                "CREATE_TIME": create_time,
-                "STATUS": info.get("status"),
+                "P_CPU_PERCENT": info["cpu_percent"],
+                "P_MEMORIA_PERCENT": round(info["memory_percent"] or 0, 2)
             })
 
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
     # Grava só os N mais pesados, senão seriam centenas de linhas por segundo
-    linhas.sort(key=lambda linha:( linha["CPU_PERCENT"] or 0, linha["RSS_BYTES"] or 0, linha["PID"] or 0), reverse=True)
+    linhas.sort(key=lambda linha: linha["CPU_PERCENT"] or 0, reverse=True)
 
     return linhas[:limite]
