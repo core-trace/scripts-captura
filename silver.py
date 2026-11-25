@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from botocore.exceptions import ClientError
 
-BUCKET = "bucket-coretrace"
+BUCKET = "buckettavares"
 BRONZE = "raw/"
 SILVER = "trusted/"
 

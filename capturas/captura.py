@@ -97,7 +97,7 @@ API_BASE_URL = "http://localhost:3333"
 
 ARQUIVO_CONFIG = Path(__file__).resolve().parent.parent / "config.json"
 
-BUCKET = "bucket-coretrace"
+BUCKET = "buckettavares"
 PASTA_S3 = "raw"
 
 s3 = None

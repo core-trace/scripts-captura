@@ -26,7 +26,7 @@ from formato_gold import (
     para_cada_medida_com_recurso
 )
 
-BUCKET = "bucket-coretrace"
+BUCKET = "buckettavares"
 SILVER = "trusted/"
 GOLD = "client/"
 
