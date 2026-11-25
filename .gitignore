@@ -1,6 +1,7 @@
 docs
 tests/*
 !tests/test_gold_logs.py
+!tests/test_kpis_processos.py
 .venv
 __pycache__/
 __init__.py
