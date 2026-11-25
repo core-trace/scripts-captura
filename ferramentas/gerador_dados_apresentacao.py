@@ -73,6 +73,12 @@ COMO USAR
     # gera os CSVs localmente, sem mexer na AWS (bom pra conferir antes)
     python ferramentas/gerador_dados_apresentacao.py --somente-local
 
+    # envia dias em sequência, aguardando a esteira (sem gatilhos concorrentes)
+    python ferramentas/gerador_dados_apresentacao.py --dias-por-lote 1 --lambda-nome NOME
+
+    # retoma mantendo a mesma janela e tamanho de lote
+    python ferramentas/gerador_dados_apresentacao.py --lambda-nome NOME --retomar-de 2026-11-10
+
     # gera, confere e mostra algumas linhas no console
     python ferramentas/gerador_dados_apresentacao.py --somente-local --amostras 3
 """
@@ -82,11 +88,14 @@ import csv
 import hashlib
 import io
 import math
+import json
+import time
 import os
 import random
 import sys
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 # A raiz do projeto entra no path para conseguir importar os módulos do próprio
@@ -2113,7 +2122,7 @@ def montar_csv(linhas, colunas, delimitador=","):
     return buffer.getvalue()
 
 
-def enviar_para_s3(conteudo, nome_arquivo, prefixo, bucket):
+def enviar_para_s3(conteudo, nome_arquivo, prefixo, bucket, cliente=None):
     """Sobe o CSV para o S3 de verdade, no prefixo raw/.
 
     As credenciais vêm do próprio ambiente (a sessão do AWS CLI / AWS Academy
@@ -2122,7 +2131,7 @@ def enviar_para_s3(conteudo, nome_arquivo, prefixo, bucket):
     """
     import boto3
 
-    cliente = boto3.client("s3")
+    cliente = cliente or boto3.client("s3")
     chave = f"{prefixo}/{nome_arquivo}"
 
     cliente.put_object(
@@ -2366,7 +2375,210 @@ def contar_reinicios_coupon_sync(linhas_eventos):
     return reinicios
 
 
+def dividir_em_lotes(categorias, dias_por_lote):
+    """Particiona por dias civis, sem regenerar, copiar ou alterar registros."""
+    fuso = ZoneInfo("America/Sao_Paulo")
+    primeiro_dia = INICIO_HISTORICO.date()
+    lotes = {}
+    for nome, (linhas, _, _, _) in categorias.items():
+        for linha in linhas:
+            instante = datetime.fromisoformat(linha["TIMESTAMP"].replace("Z", "+00:00"))
+            if instante.tzinfo is None:
+                instante = instante.replace(tzinfo=fuso)
+            dia = instante.astimezone(fuso).date()
+            inicio = primeiro_dia + timedelta(
+                days=((dia - primeiro_dia).days // dias_por_lote) * dias_por_lote
+            )
+            lote = lotes.setdefault(inicio, {categoria: [] for categoria in categorias})
+            lote[nome].append(linha)
+    return dict(sorted(lotes.items()))
+
+
+def nome_arquivo_lote(nome, inicio, dias_por_lote, conteudo):
+    # A identidade inclui o conteúdo: repetir a mesma execução sobrescreve a
+    # mesma chave, inclusive numa retomada após upload parcial.
+    digest = hashlib.sha256(conteudo.encode("utf-8")).hexdigest()
+    return f"{nome}_{inicio:%Y%m%d}T000000_{dias_por_lote}d_{digest}.csv"
+
+
+def verificar_gatilhos(sessao, s3, cliente_lambda, bucket, nome_lambda):
+    """Preflight somente leitura. Falta de permissão também impede o envio.
+
+    Notificações indiretas (SNS/SQS/EventBridge) são bloqueadas de forma
+    conservadora: este script não consegue provar que não disparam a esteira.
+    A verificação é um retrato da configuração, não um lock distribuído.
+    """
+    configuracao = cliente_lambda.get_function_configuration(FunctionName=nome_lambda)
+    arn = configuracao["FunctionArn"].split(":")
+    arn = ":".join(arn[:7])  # inclui function:nome, sem versão/alias
+    notificacoes = s3.get_bucket_notification_configuration(Bucket=bucket)
+    conflitos = []
+    for campo in ("LambdaFunctionConfigurations", "QueueConfigurations", "TopicConfigurations"):
+        if notificacoes.get(campo):
+            conflitos.append(f"S3: {campo}")
+    if "EventBridgeConfiguration" in notificacoes:
+        conflitos.append("S3: notificações EventBridge habilitadas")
+
+    def mesma_funcao(alvo):
+        return alvo == arn or alvo.startswith(arn + ":")
+
+    for pagina in cliente_lambda.get_paginator("list_event_source_mappings").paginate(FunctionName=arn):
+        for origem in pagina.get("EventSourceMappings", []):
+            if origem.get("State") != "Disabled":
+                conflitos.append(f"event source mapping: {origem['UUID']}")
+
+    eventos = sessao.client("events")
+
+    def paginas_barramentos():
+        parametros = {}
+        while True:
+            pagina = eventos.list_event_buses(**parametros)
+            yield pagina
+            if not pagina.get("NextToken"):
+                return
+            parametros["NextToken"] = pagina["NextToken"]
+
+    for pagina in paginas_barramentos():
+        for barramento in pagina.get("EventBuses", []):
+            for regras in eventos.get_paginator("list_rules").paginate(EventBusName=barramento["Name"]):
+                for regra in regras.get("Rules", []):
+                    if regra.get("State") == "DISABLED":
+                        continue
+                    for alvos in eventos.get_paginator("list_targets_by_rule").paginate(
+                        Rule=regra["Name"], EventBusName=barramento["Name"]
+                    ):
+                        if any(mesma_funcao(alvo["Arn"]) for alvo in alvos.get("Targets", [])):
+                            conflitos.append(f"EventBridge: {regra['Name']}")
+
+    scheduler = sessao.client("scheduler")
+    for pagina in scheduler.get_paginator("list_schedules").paginate():
+        for agenda in pagina.get("Schedules", []):
+            alvo = agenda.get("Target", {}).get("Arn", "")
+            if agenda.get("State") == "ENABLED" and (
+                mesma_funcao(alvo) or ":aws-sdk:lambda:invoke" in alvo
+            ):
+                conflitos.append(f"Scheduler: {agenda['GroupName']}/{agenda['Name']}")
+
+    # Impede execução simultânea mesmo se outro chamador surgir depois da
+    # verificação. Não altera a configuração da conta automaticamente.
+    concorrencia = cliente_lambda.get_function_concurrency(FunctionName=arn)
+    if concorrencia.get("ReservedConcurrentExecutions") != 1:
+        conflitos.append("configure a concorrência reservada da Lambda como 1 para esta carga")
+    if conflitos:
+        raise RuntimeError("Envio bloqueado por risco de concorrência: " + "; ".join(conflitos))
+    print("[AWS] Verificação concluída. Mantenha gatilhos suspensos e não execute outro produtor durante a carga.", flush=True)
+    return configuracao["Timeout"]
+
+
+def invocar_lambda(cliente, nome_lambda):
+    resposta = cliente.invoke(
+        FunctionName=nome_lambda, InvocationType="RequestResponse", Payload=b"{}"
+    )
+    corpo = resposta["Payload"]
+    try:
+        texto = corpo.read().decode("utf-8")
+    finally:
+        corpo.close()
+    if resposta.get("FunctionError") or resposta.get("StatusCode") != 200:
+        raise RuntimeError(f"Lambda falhou: {resposta.get('FunctionError')}: {texto[:2000]}")
+    resultado = json.loads(texto)
+    # Contrato do lambda_handler atual: statusCode=200 e body JSON.
+    if not isinstance(resultado, dict) or resultado.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda não confirmou sucesso: {texto[:2000]}")
+    corpo_resultado = resultado.get("body")
+    if isinstance(corpo_resultado, str):
+        try:
+            corpo_resultado = json.loads(corpo_resultado)
+        except ValueError:
+            raise RuntimeError(f"Resposta da Lambda fora do contrato: {texto[:2000]}")
+    for parte in (resultado, corpo_resultado):
+        if isinstance(parte, dict) and (
+            any(parte.get(chave) for chave in ("error", "errorMessage", "erro", "errors"))
+            or parte.get("success") is False
+            or ("statusCode" in parte and parte["statusCode"] != 200)
+        ):
+            raise RuntimeError(f"Erro no conteúdo da Lambda: {texto[:2000]}")
+    if corpo_resultado != "Pipeline Silver + Gold finalizado com sucesso!":
+        raise RuntimeError(f"Confirmação inesperada da Lambda: {texto[:2000]}")
+
+
+def executar_lotes(categorias, argumentos, inicio_execucao):
+    lotes = dividir_em_lotes(categorias, argumentos.dias_por_lote)
+    if argumentos.retomar_de and argumentos.retomar_de not in lotes:
+        raise ValueError("--retomar-de deve ser a data inicial de um lote, mantendo --dias-historico e --dias-por-lote originais")
+    selecionados = [(dia, lote) for dia, lote in lotes.items()
+                    if argumentos.retomar_de is None or dia >= argumentos.retomar_de]
+    bucket = os.environ.get("BUCKET_DESTINO")
+    cliente_s3 = cliente_lambda = None
+    if not argumentos.somente_local:
+        print("ATENÇÃO: a Gold atual ainda relê todo trusted/; os lotes não limitam o histórico reprocessado.", flush=True)
+        if not bucket:
+            raise ValueError("Defina BUCKET_DESTINO ou use --somente-local")
+        import boto3
+        from botocore.config import Config
+        # Uma tentativa total evita reexecuções automáticas após timeout de rede.
+        config = Config(connect_timeout=10, read_timeout=60,
+                        retries={"total_max_attempts": 1}, tcp_keepalive=True)
+        sessao = boto3.Session()
+        cliente_s3 = sessao.client("s3", config=config)
+        if argumentos.lambda_nome:
+            cliente_lambda = sessao.client("lambda", config=config)
+            timeout = verificar_gatilhos(sessao, cliente_s3, cliente_lambda, bucket, argumentos.lambda_nome)
+            cliente_lambda = sessao.client("lambda", config=config.merge(Config(read_timeout=timeout + 60)))
+        else:
+            print("ATENÇÃO: sem --lambda-nome, modo somente upload; nenhum processamento será confirmado.", flush=True)
+    else:
+        Path(argumentos.pasta).mkdir(parents=True, exist_ok=True)
+
+    concluidos = registros = arquivos = falhas = 0
+    try:
+        for indice, (dia, lote) in enumerate(selecionados, 1):
+            inicio_lote = time.monotonic()
+            print(f"\n[LOTE {indice:02}/{len(selecionados):02}] Data: {dia} (até {min(dia + timedelta(days=argumentos.dias_por_lote - 1), FIM.date())})", flush=True)
+            for nome, linhas in lote.items():
+                print(f"  {nome}: {len(linhas)} registros", flush=True)
+            try:
+                for nome, linhas in lote.items():
+                    if not linhas:
+                        continue
+                    _, colunas, delimitador, prefixo = categorias[nome]
+                    conteudo = montar_csv(linhas, colunas, delimitador)
+                    arquivo = nome_arquivo_lote(nome, dia, argumentos.dias_por_lote, conteudo)
+                    if argumentos.amostras > 0:
+                        print(f"--- amostra de {nome} ({arquivo}) ---")
+                        print("\n".join(conteudo.splitlines()[:argumentos.amostras + 1]))
+                    if argumentos.somente_local:
+                        destino = Path(argumentos.pasta) / arquivo
+                        destino.write_text(conteudo, encoding="utf-8")
+                        print(f"[local] Salvo: {destino}", flush=True)
+                    else:
+                        enviar_para_s3(conteudo, arquivo, prefixo, bucket, cliente=cliente_s3)
+                    arquivos += 1
+                    registros += len(linhas)
+                if cliente_lambda is not None:
+                    print("Upload concluído. Executando Lambda...", flush=True)
+                    invocar_lambda(cliente_lambda, argumentos.lambda_nome)
+                    print("Processamento concluído com sucesso.", flush=True)
+                concluidos += 1
+                print(f"Tempo total do lote: {time.monotonic() - inicio_lote:.1f}s", flush=True)
+                if not argumentos.somente_local and indice < len(selecionados):
+                    time.sleep(argumentos.intervalo_entre_lotes)
+            except (Exception, KeyboardInterrupt) as erro:
+                falhas += 1
+                print(f"FALHA no lote {dia}: {erro}\nRetome com --retomar-de {dia}, mantendo os demais parâmetros. "
+                      "Se a conexão caiu, confira a execução da Lambda antes de retomar; ela pode ainda estar em andamento.", flush=True)
+                return 1
+    finally:
+        modo = "salvos localmente" if argumentos.somente_local else "enviados"
+        print(f"\nResumo: {concluidos}/{len(selecionados)} lotes concluídos; "
+              f"{registros} registros e {arquivos} arquivos {modo}; {falhas} falhas; "
+              f"tempo total: {time.monotonic() - inicio_execucao:.1f}s. "
+              f"Processamento {'confirmado para os lotes concluídos' if cliente_lambda is not None else 'não confirmado (modo local/upload)'}.", flush=True)
+    return 0
+
+
 def main():
+    inicio_execucao = time.monotonic()
     analisador = argparse.ArgumentParser(
         description="Gera os CSVs do cenário Black Friday e sobe para o S3 (prefixo raw/)."
     )
@@ -2397,7 +2609,15 @@ def main():
             "pra iterar rápido."
         ),
     )
+    analisador.add_argument("--dias-por-lote", type=int, default=1, help="dias civis por lote (padrão: 1)")
+    analisador.add_argument("--lambda-nome", help="Lambda Silver + Gold a invocar sincronamente")
+    analisador.add_argument("--intervalo-entre-lotes", type=float, default=0, help="pausa adicional em segundos; não confirma processamento")
+    analisador.add_argument("--retomar-de", type=date.fromisoformat, help="data inicial do lote a retomar (AAAA-MM-DD); preserve os outros parâmetros")
     argumentos = analisador.parse_args()
+    if argumentos.dias_por_lote < 1:
+        analisador.error("--dias-por-lote deve ser maior que zero")
+    if not math.isfinite(argumentos.intervalo_entre_lotes) or argumentos.intervalo_entre_lotes < 0:
+        analisador.error("--intervalo-entre-lotes deve ser finito e não negativo")
 
     if argumentos.dias_historico < 0:
         print("ERRO: --dias-historico não pode ser negativo.")
@@ -2421,12 +2641,6 @@ def main():
     linhas_eventos = gerar_linhas_eventos()
     linhas_logs = gerar_linhas_logs()
 
-    conteudo_metricas = montar_csv(linhas_metricas, cabecalho)
-    conteudo_processos = montar_csv(linhas_processos, COLUNAS_PROCESSOS)
-    conteudo_containers = montar_csv(linhas_containers, COLUNAS_CONTAINERS)
-    conteudo_eventos = montar_csv(linhas_eventos, COLUNAS_EVENTOS, delimitador=";")
-    conteudo_logs = montar_csv(linhas_logs, COLUNAS_LOGS, delimitador=";")
-
     print(f"  métricas: {len(linhas_metricas)} linhas x {len(cabecalho)} colunas")
     print(f"  processos: {len(linhas_processos)} linhas x {len(COLUNAS_PROCESSOS)} colunas")
     print(f"  containers: {len(linhas_containers)} linhas x {len(COLUNAS_CONTAINERS)} colunas")
@@ -2441,43 +2655,22 @@ def main():
     problemas.extend(validar_cobertura(horarios_da_janela()))
     contar_reinicios_coupon_sync(linhas_eventos)
 
-    carimbo = datetime.now().strftime("%Y%m%dT%H%M%S")
-    arquivos = [
-        ("metricas", conteudo_metricas, f"metricas_{carimbo}.csv", PREFIXO_S3),
-        ("processos", conteudo_processos, f"processos_{carimbo}.csv", PREFIXO_S3),
-        ("containers", conteudo_containers, f"containers_{carimbo}.csv", PREFIXO_S3_CONTAINERS),
-        ("eventos", conteudo_eventos, f"eventos_{carimbo}.csv", PREFIXO_S3_EVENTOS),
-        ("logs", conteudo_logs, f"logs_{carimbo}.csv", PREFIXO_S3_LOGS),
-    ]
-
-    if argumentos.amostras > 0:
-        for nome, conteudo, arquivo, _ in arquivos:
-            print(f"\n--- amostra de {nome} ({arquivo}) ---")
-            for linha in conteudo.splitlines()[: argumentos.amostras + 1]:
-                print(linha)
-
-    if argumentos.somente_local:
-        pasta = Path(argumentos.pasta)
-        pasta.mkdir(parents=True, exist_ok=True)
-        for nome, conteudo, arquivo, _ in arquivos:
-            destino = pasta / arquivo
-            destino.write_text(conteudo, encoding="utf-8")
-            print(f"[local] Salvo: {destino}")
-        print("\nNão houve upload (--somente-local).")
-    else:
-        bucket = os.environ.get("BUCKET_DESTINO")
-        if not bucket:
-            print(
-                "ERRO: a variável de ambiente BUCKET_DESTINO não está definida.\n"
-                "      Exemplo: BUCKET_DESTINO=coretrace-teste-marcelly-757158332486 \\\n"
-                "               python ferramentas/gerador_dados_apresentacao.py\n"
-                "      (use --somente-local para gerar os CSVs sem subir para a AWS)"
-            )
-            return 1
-
-        print(f"\nEnviando para o bucket {bucket}...")
-        for nome, conteudo, arquivo, prefixo in arquivos:
-            enviar_para_s3(conteudo, arquivo, prefixo, bucket)
+    categorias = {
+        "metricas": (linhas_metricas, cabecalho, ",", PREFIXO_S3),
+        "processos": (linhas_processos, COLUNAS_PROCESSOS, ",", PREFIXO_S3),
+        "containers": (linhas_containers, COLUNAS_CONTAINERS, ",", PREFIXO_S3_CONTAINERS),
+        "eventos": (linhas_eventos, COLUNAS_EVENTOS, ";", PREFIXO_S3_EVENTOS),
+        "logs": (linhas_logs, COLUNAS_LOGS, ";", PREFIXO_S3_LOGS),
+    }
+    try:
+        resultado = executar_lotes(categorias, argumentos, inicio_execucao)
+    except Exception as erro:
+        print(f"ERRO antes do envio dos lotes: {erro}", flush=True)
+        print(f"Resumo: 0 lotes concluídos; 0 registros e 0 arquivos enviados; "
+              f"1 falha; tempo total: {time.monotonic() - inicio_execucao:.1f}s.", flush=True)
+        return 1
+    if resultado:
+        return resultado
 
     if problemas:
         print("\nATENÇÃO: confira os problemas listados acima antes de apresentar.")
