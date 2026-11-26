@@ -73,6 +73,12 @@ COMO USAR
     # gera os CSVs localmente, sem mexer na AWS (bom pra conferir antes)
     python ferramentas/gerador_dados_apresentacao.py --somente-local
 
+    # envia dias em sequência, aguardando a esteira (sem gatilhos concorrentes)
+    python ferramentas/gerador_dados_apresentacao.py --dias-por-lote 1 --lambda-nome NOME
+
+    # retoma mantendo a mesma janela e tamanho de lote
+    python ferramentas/gerador_dados_apresentacao.py --lambda-nome NOME --retomar-de 2026-11-10
+
     # gera, confere e mostra algumas linhas no console
     python ferramentas/gerador_dados_apresentacao.py --somente-local --amostras 3
 """
@@ -81,11 +87,15 @@ import argparse
 import csv
 import hashlib
 import io
+import math
+import json
+import time
 import os
 import random
 import sys
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 # A raiz do projeto entra no path para conseguir importar os módulos do próprio
@@ -108,6 +118,14 @@ from swap.coleta import colunas_swap, preparar_coleta_swap
 # arquivo gerado tem exatamente o mesmo formato que o agente real produz.
 from capturas.containers.metricas import COLUNAS_METRICAS as COLUNAS_CONTAINERS
 
+# Idem para logs e eventos de Docker (capturas/containers/logs.py e eventos.py).
+# O agente real (capturas/captura_docker.py) escreve os três CSVs de Docker com
+# ';' como delimitador - diferente dos CSVs de métricas/processos/containers
+# deste gerador, que usam ',' (a Silver detecta o delimitador de cada arquivo
+# automaticamente, csv.Sniffer via pandas `sep=None`, então os dois convivem).
+from capturas.containers.logs import COLUNAS_LOGS
+from capturas.containers.eventos import COLUNAS_EVENTOS, descrever_evento
+
 # Para a conferência final usamos as MESMAS funções que a Gold usa
 # (resumos_gold.py). Assim o script não reimplementa a regra de classificação:
 # se a regra mudar lá, a conferência daqui continua dizendo a verdade.
@@ -120,10 +138,20 @@ from resumos_gold import calcular_severidade, calcular_tempo_no_estado, classifi
 
 DIA = "2026-11-27"
 
-# Janela de tempo: uma leitura por minuto, das 18h45 às 20h30 (fim incluso).
+# Janela narrada: uma leitura por minuto, das 18h45 às 20h30 de 27/11 (fim
+# incluso). As âncoras do incidente (seções 4 e seguintes) são relativas a
+# este intervalo e não mudam - é a "foto" oficial do cenário mestre.
 INICIO = datetime(2026, 11, 27, 18, 45)
 FIM = datetime(2026, 11, 27, 20, 30)
 INTERVALO_SEGUNDOS = 60
+
+# Histórico: quantos dias ANTES de FIM o gerador cobre (seção 3 do cenário
+# Docker V2 - "Janela de 30 dias corridos: 28/10/2026 20h30 a 27/11/2026
+# 20h30"). INICIO_HISTORICO é reatribuída em main() a partir de
+# --dias-historico; o valor aqui é só o padrão usado quando o módulo é
+# importado fora do CLI (por exemplo em teste manual no console).
+DIAS_HISTORICO_PADRAO = 30
+INICIO_HISTORICO = FIM - timedelta(days=DIAS_HISTORICO_PADRAO)
 
 # Empresa iFood (database/script.sql). Os três perfis pertencem à mesma empresa,
 # por isso o token de instalação é o mesmo; o token de perfil é que define os
@@ -140,6 +168,8 @@ TOKENS_PERFIL = {
 # qualquer um dos dois funciona - mantivemos o mesmo desenho dos agentes reais.
 PREFIXO_S3 = "raw"
 PREFIXO_S3_CONTAINERS = "raw/docker/metricas"
+PREFIXO_S3_EVENTOS = "raw/docker/eventos"
+PREFIXO_S3_LOGS = "raw/docker/logs"
 
 # Semente fixa do gerador: a mesma execução produz sempre os mesmos números.
 # Importante para o dia da apresentação - dá para comparar duas execuções e
@@ -307,6 +337,161 @@ def estavel(base, amplitude, aleatorio):
 
     def calcular(timestamp):
         return base + aleatorio.uniform(-amplitude, amplitude)
+
+    return calcular
+
+
+# ===========================================================================
+# 4.1. Histórico anterior ao incidente (seção 3 e 4 do cenário Docker V2)
+# ===========================================================================
+#
+# A janela narrada (18h45-20h30 de 27/11) continua usando `curva()`/`estavel()"
+# exatamente como antes - isso não muda. O que muda é o que acontece ANTES
+# dela: em vez de não existir nenhuma amostra, agora há até 30 dias de
+# histórico com perfil diurno (pico de almoço e de jantar), uma variação
+# pequena e determinística entre dias, e um punhado de episódios pontuais com
+# data completa (seção 4 do documento). Esses episódios são PROPOSTAS de
+# calibração ("a duração, horários e valores podem ser calibrados para os
+# agregados reais, preservando as descobertas pretendidas" - seção 4, rodapé)
+# e não números oficiais do cenário mestre, que só descreve a janela
+# 18h45-20h30 e os totais da seção 3.
+
+# Pico de almoço (meio-dia) e de jantar (19h30) - mesma forma pra CPU e RAM
+# de todo mundo; a amplitude de cada métrica/servidor é decidida por quem usa
+# esse multiplicador, não aqui.
+PICOS_DIURNOS = [
+    (12.0, 0.22, 1.4),
+    (19.5, 0.30, 1.6),
+]
+
+
+def fator_diurno(timestamp):
+    """Multiplicador em torno de 1.0 que sobe no almoço/jantar e cai de
+    madrugada (0h-6h). É a FORMA da curva diária; a amplitude real de cada
+    métrica é aplicada por quem chama (ver `amortecer_fator`)."""
+    hora_fracionaria = timestamp.hour + timestamp.minute / 60 + timestamp.second / 3600
+    fator = 1.0
+    for centro, amplitude, largura in PICOS_DIURNOS:
+        distancia = min(abs(hora_fracionaria - centro), 24 - abs(hora_fracionaria - centro))
+        fator += amplitude * math.exp(-(distancia ** 2) / (2 * largura ** 2))
+    if hora_fracionaria < 6:
+        fator *= 0.6 + 0.4 * (hora_fracionaria / 6)
+    return fator
+
+
+def amortecer_fator(fator, intensidade):
+    """Aproxima `fator` de 1.0 - usado pra containers/processos, que variam
+    menos ao longo do dia do que o host inteiro. intensidade=1 mantém o fator
+    cheio; intensidade=0 deixaria tudo flat (sem variação diária)."""
+    return 1.0 + intensidade * (fator - 1.0)
+
+
+def curva_absoluta(ancoras_datetime):
+    """Como `curva()`, mas as âncoras são datetimes completos (ano/mês/dia/
+    hora/min), não só hora:minuto. Fora do intervalo [primeira, última]
+    âncora devolve None - quem chama sabe então que não há episódio ativo
+    nesse instante e deve usar o histórico comum (perfil diurno)."""
+    ancoras = sorted(ancoras_datetime, key=lambda item: item[0])
+
+    def calcular(timestamp):
+        if timestamp < ancoras[0][0] or timestamp > ancoras[-1][0]:
+            return None
+        for (inicio_a, valor_a), (inicio_b, valor_b) in zip(ancoras, ancoras[1:]):
+            if inicio_a <= timestamp <= inicio_b:
+                total_segundos = (inicio_b - inicio_a).total_seconds()
+                if total_segundos <= 0:
+                    return valor_b
+                fracao = (timestamp - inicio_a).total_seconds() / total_segundos
+                return valor_a + (valor_b - valor_a) * fracao
+        return ancoras[-1][1]
+
+    return calcular
+
+
+def valor_historico(base, timestamp, aleatorio, amplitude_jitter, intensidade_diurna=1.0):
+    """Preenchimento do histórico fora da janela narrada e fora de qualquer
+    episódio pontual: a base (mesmo "estável" que o cenário já usava) com
+    perfil diurno e um jitter pequeno e determinístico (a semente do próprio
+    `aleatorio` do servidor/processo/container)."""
+    fator = amortecer_fator(fator_diurno(timestamp), intensidade_diurna)
+    return base * fator + aleatorio.uniform(-amplitude_jitter, amplitude_jitter)
+
+
+# Episódios históricos do HOST (CPU/RAM), seção 4 do cenário Docker V2.
+# Cada entrada: (datetime_inicio, datetime_fim, valor_de_pico). O valor nas
+# pontas é sempre a base histórica do servidor (ver `curva_host_com_historico`),
+# então o episódio sobe da base até `valor_de_pico` e desce de volta - não
+# precisa repetir a base aqui.
+EPISODIOS_HOST_CPU = {
+    "cart-api-07": [
+        # 12/11: pico curto de CPU e tráfego, recuperação espontânea -
+        # contraste deliberado com o incidente prolongado de 27/11.
+        (datetime(2026, 11, 12, 18, 55), datetime(2026, 11, 12, 19, 25), 68),
+        # 20-23/11: maior frequência de picos de CPU (throttling leve é
+        # modelado na camada de containers, não aqui no host).
+        (datetime(2026, 11, 20, 11, 30), datetime(2026, 11, 20, 13, 0), 58),
+        (datetime(2026, 11, 21, 19, 0), datetime(2026, 11, 21, 20, 0), 60),
+        (datetime(2026, 11, 22, 12, 30), datetime(2026, 11, 22, 13, 30), 57),
+        (datetime(2026, 11, 23, 19, 15), datetime(2026, 11, 23, 20, 15), 61),
+        # 25/11: CPU alta por mais tempo.
+        (datetime(2026, 11, 25, 19, 10), datetime(2026, 11, 25, 19, 55), 72),
+        # 26/11: mais concorrência, normalização parcial (não volta à base).
+        (datetime(2026, 11, 26, 18, 50), datetime(2026, 11, 26, 19, 45), 70),
+        (datetime(2026, 11, 26, 19, 45), datetime(2026, 11, 26, 21, 0), 56),
+    ],
+}
+
+EPISODIOS_HOST_RAM = {
+    "pay-api-04": [
+        # 25/11: crescimento de RAM e fila, redução parcial após o pico.
+        (datetime(2026, 11, 25, 19, 10), datetime(2026, 11, 25, 19, 55), 76),
+        (datetime(2026, 11, 25, 19, 55), datetime(2026, 11, 25, 21, 0), 68),
+        # 26/11: RAM permanece mais elevada após o jantar (sem OOM).
+        (datetime(2026, 11, 26, 18, 50), datetime(2026, 11, 26, 19, 45), 74),
+        (datetime(2026, 11, 26, 19, 45), datetime(2026, 11, 26, 23, 0), 70),
+    ],
+}
+
+
+def curva_host_com_historico(servidor, metrica, ancoras_narradas, base_historica,
+                              episodios, aleatorio, amplitude_jitter):
+    """Monta a função de valor(timestamp) de uma métrica de HOST (CPU ou RAM)
+    cobrindo tanto a janela narrada quanto o histórico de até 30 dias.
+
+    Dentro de [INICIO, FIM]: usa EXATAMENTE `curva(ancoras_narradas)` quando
+    o servidor tem âncoras narradas (cart-api-07, cart-api-12, pay-api-04,
+    pay-db-02) - sem nenhuma alteração, é a curva oficial do cenário mestre.
+    Os servidores "normais" (sem âncora, só `cpu_estavel`/`ram_estavel`)
+    continuam EXATAMENTE como antes dentro dessa janela também: valor estável
+    com jitter, sem perfil diurno - essa preservação é literal (seção 2 do
+    prompt: "não modifique as curvas originais de hosts... entre 18h45 e
+    20h30"), o perfil diurno deles só entra no histórico, fora da janela.
+    Fora da janela narrada: usa o episódio pontual ativo (se houver,
+    interpolando base -> pico -> base com `curva_absoluta`) ou, na ausência
+    de episódio, o perfil diurno em torno de `base_historica` (seção 4:
+    "picos habituais de almoço e jantar, sem instabilidade persistente").
+    """
+    curva_narrada = curva(ancoras_narradas) if ancoras_narradas else None
+    episodios_do_servidor = episodios.get(servidor["nome"], [])
+
+    def calcular(timestamp):
+        if curva_narrada is not None and INICIO <= timestamp <= FIM:
+            return curva_narrada(timestamp)
+
+        if curva_narrada is None and INICIO <= timestamp <= FIM:
+            return base_historica + aleatorio.uniform(-amplitude_jitter, amplitude_jitter)
+
+        for inicio_ep, fim_ep, pico in episodios_do_servidor:
+            if inicio_ep <= timestamp <= fim_ep:
+                meio = inicio_ep + (fim_ep - inicio_ep) / 2
+                subindo = curva_absoluta([(inicio_ep, base_historica), (meio, pico)])
+                descendo = curva_absoluta([(meio, pico), (fim_ep, base_historica)])
+                valor_episodio = subindo(timestamp)
+                if valor_episodio is None:
+                    valor_episodio = descendo(timestamp)
+                return valor_episodio + aleatorio.uniform(-amplitude_jitter, amplitude_jitter)
+
+        return valor_historico(base_historica, timestamp, aleatorio, amplitude_jitter)
 
     return calcular
 
@@ -628,6 +813,54 @@ PROCESSOS_EXTRAPOLADOS = [
 # imagem, número de processos) são preenchimento realista, no mesmo espírito do
 # resto do script.
 
+# Episódios de container são (datetime_inicio, datetime_fim, fracao_de_pico)
+# - mesma forma dos episódios de host (seção 4.1), só que em FRAÇÃO do valor
+# final do cenário mestre (1.0 = valor oficial da tabela acima), não em
+# unidade absoluta. "fracao_historica" é o nível de repouso fora de qualquer
+# janela especial; dentro da janela narrada (18h45-20h30) o container sobe de
+# fracao_historica até 1.0 acompanhando o PROGRESSO da curva do host (seção
+# B: "garanta coerência entre containers e hosts em todos os instantes") -
+# os números oficiais (cpu_percent/ram_gib da tabela) continuam batendo
+# exatamente em FIM (20h30), só a trajetória até lá deixou de ser uma reta
+# constante. Isso não é narrado pelo cenário mestre (que só fala do estado em
+# 20h30); é calibração deste gerador, documentada aqui.
+EPISODIOS_CART_API_JAVA = [
+    (datetime(2026, 11, 12, 18, 55), datetime(2026, 11, 12, 19, 25), 0.55),
+    (datetime(2026, 11, 20, 11, 30), datetime(2026, 11, 20, 13, 0), 0.45),
+    (datetime(2026, 11, 21, 19, 0), datetime(2026, 11, 21, 20, 0), 0.47),
+    (datetime(2026, 11, 22, 12, 30), datetime(2026, 11, 22, 13, 30), 0.44),
+    (datetime(2026, 11, 23, 19, 15), datetime(2026, 11, 23, 20, 15), 0.48),
+    (datetime(2026, 11, 25, 19, 10), datetime(2026, 11, 25, 19, 55), 0.68),
+    (datetime(2026, 11, 26, 18, 50), datetime(2026, 11, 26, 19, 45), 0.70),
+    (datetime(2026, 11, 26, 19, 45), datetime(2026, 11, 26, 21, 0), 0.52),
+]
+
+# Mesmas janelas acima (menos o pico isolado de 12/11, que "recupera
+# espontaneamente" e não tem throttling) servem pra ligar o throttling do
+# cart-api-java; a janela final é a própria tarde da Black Friday, a partir
+# de quando o host cruza a atenção (19h25, cenário mestre seção 4).
+JANELAS_THROTTLING_CART_API_JAVA = [
+    (datetime(2026, 11, 20, 11, 30), datetime(2026, 11, 20, 13, 0)),
+    (datetime(2026, 11, 21, 19, 0), datetime(2026, 11, 21, 20, 0)),
+    (datetime(2026, 11, 22, 12, 30), datetime(2026, 11, 22, 13, 30)),
+    (datetime(2026, 11, 23, 19, 15), datetime(2026, 11, 23, 20, 15)),
+    (datetime(2026, 11, 25, 19, 10), datetime(2026, 11, 25, 19, 55)),
+    (datetime(2026, 11, 26, 18, 50), datetime(2026, 11, 26, 21, 0)),
+    (datetime(2026, 11, 27, 19, 25), FIM),
+]
+
+EPISODIOS_PAY_API_JAVA_RAM = [
+    (datetime(2026, 11, 25, 19, 10), datetime(2026, 11, 25, 19, 55), 0.78),
+    (datetime(2026, 11, 25, 19, 55), datetime(2026, 11, 25, 21, 0), 0.64),
+    (datetime(2026, 11, 26, 18, 50), datetime(2026, 11, 26, 19, 45), 0.74),
+    (datetime(2026, 11, 26, 19, 45), datetime(2026, 11, 26, 23, 0), 0.68),
+]
+
+EPISODIOS_PAY_RETRY_WORKER_RAM = [
+    (datetime(2026, 11, 25, 19, 10), datetime(2026, 11, 25, 19, 55), 0.70),
+    (datetime(2026, 11, 26, 18, 50), datetime(2026, 11, 26, 19, 45), 0.68),
+]
+
 CONTAINERS = {
     "pay-api-04": [
         {
@@ -642,6 +875,14 @@ CONTAINERS = {
             "disco_mb_s": (18.0, 7.0),
             "imagem_mb": 812,
             "camada_gravavel_mb": 640,
+            # CPU acompanha a pressão geral do host (ancora_cpu_host);
+            # RAM é o protagonista da pressão de memória do Financeiro,
+            # com episódios próprios.
+            "fracao_historica_cpu": 0.35,
+            "ancora_cpu_host": "cpu_ancoras",
+            "fracao_historica_ram": 0.45,
+            "ancora_ram_host": "ram_ancoras",
+            "episodios_ram": EPISODIOS_PAY_API_JAVA_RAM,
         },
         {
             "nome": "pay-gateway-node",
@@ -655,6 +896,10 @@ CONTAINERS = {
             "disco_mb_s": (4.0, 2.0),
             "imagem_mb": 246,
             "camada_gravavel_mb": 180,
+            # Tráfego externo: participa um pouco da pressão do host, sem
+            # ficar perto do crítico - segue "saudável operacionalmente".
+            "fracao_historica_cpu": 0.75,
+            "ancora_cpu_host": "cpu_ancoras",
         },
         {
             "nome": "pay-retry-worker",
@@ -668,6 +913,12 @@ CONTAINERS = {
             "disco_mb_s": (1.5, 0.8),
             "imagem_mb": 198,
             "camada_gravavel_mb": 96,
+            # "Crescimento de filas e tarefas" acompanha a pressão de RAM do
+            # host (é o sinal de backlog), com um eco mais discreto dos
+            # mesmos episódios do pay-api-java.
+            "fracao_historica_cpu": 0.55,
+            "ancora_cpu_host": "ram_ancoras",
+            "episodios_cpu": EPISODIOS_PAY_RETRY_WORKER_RAM,
         },
     ],
     "cart-api-07": [
@@ -683,6 +934,14 @@ CONTAINERS = {
             "disco_mb_s": (22.0, 9.0),
             "imagem_mb": 905,
             "camada_gravavel_mb": 720,
+            # Protagonista de CPU e throttling (seção B do cenário V2):
+            # historicamente baixo, com episódios pontuais e throttling
+            # correlacionado só nessas janelas (nunca a partir da CPU
+            # instantânea - seção 7 do cenário Docker V2).
+            "fracao_historica_cpu": 0.30,
+            "ancora_cpu_host": "cpu_ancoras",
+            "episodios_cpu": EPISODIOS_CART_API_JAVA,
+            "janelas_throttling": JANELAS_THROTTLING_CART_API_JAVA,
         },
         {
             "nome": "cart-worker-node",
@@ -696,6 +955,10 @@ CONTAINERS = {
             "disco_mb_s": (3.0, 1.2),
             "imagem_mb": 254,
             "camada_gravavel_mb": 150,
+            # "Demanda moderada, permanece ativo": participa pouco da
+            # pressão do host, sem episódios próprios.
+            "fracao_historica_cpu": 0.65,
+            "ancora_cpu_host": "cpu_ancoras",
         },
         {
             "nome": "redis-cache",
@@ -709,10 +972,20 @@ CONTAINERS = {
             "disco_mb_s": (0.6, 0.4),
             "imagem_mb": 41,
             "camada_gravavel_mb": 12,
+            # "Referência relativamente estável": variação mínima o tempo
+            # todo, sem episódios.
+            "fracao_historica_cpu": 0.92,
+            "ancora_cpu_host": "cpu_ancoras",
         },
         {
             # Container que falha: 2 reinicializações (20h11 e 20h16) e
-            # encerramento final às 20h18 com código de saída 1.
+            # encerramento final às 20h18 com código de saída 1 - as DUAS
+            # únicas reinicializações acumuladas do servidor (cenário
+            # mestre, seção 7). O episódio de 24/11 (seção 4 do cenário
+            # Docker V2) é tratado como falha transitória RECUPERÁVEL, sem
+            # reinício de container: fica só nos logs/eventos (ver
+            # `gerar_linhas_eventos`/`gerar_linhas_logs`), para não alterar
+            # esse total oficial.
             "nome": "coupon-sync",
             "funcao": "Sincronização de cupons",
             "imagem": "coupon-sync:1.1.0",
@@ -724,9 +997,10 @@ CONTAINERS = {
             "disco_mb_s": (1.2, 0.6),
             "imagem_mb": 188,
             "camada_gravavel_mb": 84,
-            "reinicios": [(20, 11), (20, 16)],
-            "encerramento": (20, 18),
+            "reinicios": [datetime(2026, 11, 27, 20, 11), datetime(2026, 11, 27, 20, 16)],
+            "encerramento": datetime(2026, 11, 27, 20, 18),
             "codigo_saida": 1,
+            "episodio_recuperavel": (datetime(2026, 11, 24, 19, 12), datetime(2026, 11, 24, 19, 18)),
         },
     ],
 }
@@ -787,12 +1061,18 @@ def gerador_aleatorio(chave):
 
 
 def horarios_da_janela():
-    """Uma leitura por minuto, de 18h45 às 20h30 (fim incluso)."""
+    """Uma leitura a cada INTERVALO_SEGUNDOS, de INICIO_HISTORICO até FIM
+    (fim incluso). Com os 30 dias padrão e amostra de 60s isso dá 43.201
+    instantes (30*1440 minutos + 1, janela inclusiva nas duas pontas - seção
+    3 do cenário Docker V2). Com --dias-historico 0, INICIO_HISTORICO ==
+    INICIO e o resultado é idêntico ao do gerador antigo (só a janela
+    narrada, 18h45-20h30 de 27/11)."""
     horarios = []
-    atual = INICIO
+    atual = INICIO_HISTORICO
+    passo = timedelta(seconds=INTERVALO_SEGUNDOS)
     while atual <= FIM:
         horarios.append(atual)
-        atual += timedelta(minutes=1)
+        atual += passo
     return horarios
 
 
@@ -953,24 +1233,52 @@ def cabecalho_metricas():
 
 
 def curvas_do_servidor(servidor, aleatorio):
-    """Junta a curva (ou o valor estável) de cada métrica do servidor."""
+    """Junta a curva de cada métrica do servidor: dentro da janela narrada é
+    exatamente a curva/valor estável de antes; fora dela (histórico de até
+    30 dias) é o perfil diurno + episódios pontuais calibrados (seção 4.1).
+    """
     if "cpu_ancoras" in servidor:
-        cpu = curva(servidor["cpu_ancoras"])
+        base_cpu = servidor["cpu_ancoras"][0][2]
+        cpu = curva_host_com_historico(
+            servidor, "cpu", servidor["cpu_ancoras"], base_cpu,
+            EPISODIOS_HOST_CPU, aleatorio, amplitude_jitter=1.5,
+        )
     else:
         base, amplitude = servidor["cpu_estavel"]
-        cpu = estavel(base, amplitude, aleatorio)
+        cpu = curva_host_com_historico(
+            servidor, "cpu", None, base, EPISODIOS_HOST_CPU, aleatorio,
+            amplitude_jitter=amplitude,
+        )
 
     if "ram_ancoras" in servidor:
-        ram = curva(servidor["ram_ancoras"])
+        base_ram = servidor["ram_ancoras"][0][2]
+        ram = curva_host_com_historico(
+            servidor, "ram", servidor["ram_ancoras"], base_ram,
+            EPISODIOS_HOST_RAM, aleatorio, amplitude_jitter=1.0,
+        )
     else:
         base, amplitude = servidor["ram_estavel"]
-        ram = estavel(base, amplitude, aleatorio)
+        ram = curva_host_com_historico(
+            servidor, "ram", None, base, EPISODIOS_HOST_RAM, aleatorio,
+            amplitude_jitter=amplitude,
+        )
 
+    # Disco não tem episódio de host dedicado no cenário Docker V2 (os picos
+    # de disco do incidente ficam na camada de containers - seção 7). Aqui
+    # só suaviza a variação diária em torno da curva/valor já existente.
     if "disco_ancoras" in servidor:
-        disco = curva(servidor["disco_ancoras"])
+        curva_disco_narrada = curva(servidor["disco_ancoras"])
+
+        def disco(timestamp):
+            return curva_disco_narrada(timestamp)
     else:
         base, amplitude = servidor["disco_estavel"]
-        disco = estavel(base, amplitude, aleatorio)
+
+        def disco(timestamp, _base=base, _amplitude=amplitude):
+            if INICIO <= timestamp <= FIM:
+                return _base + aleatorio.uniform(-_amplitude, _amplitude)
+            return valor_historico(_base, timestamp, aleatorio, _amplitude,
+                                    intensidade_diurna=0.3)
 
     return cpu, ram, disco
 
@@ -1294,18 +1602,30 @@ def gerar_linhas_processos():
         rss = curva(definicao["rss_ancoras_gb"])
 
         fim_captura = servidor.get("fim_captura", FIM)
-        # O processo já estava de pé antes da janela; o agente converte o epoch
-        # do psutil para esse formato de string.
-        create_time = (INICIO - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+        # O processo já estava de pé antes do início do histórico; o agente
+        # converte o epoch do psutil para esse formato de string.
+        create_time = (INICIO_HISTORICO - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
         threads_base = threads_por_nome[definicao["nome"]]
 
         for horario in horarios_da_janela():
             if horario > fim_captura:
                 continue
 
+            # Fora da janela narrada, as âncoras de CPU/RSS ficam "grudadas"
+            # no primeiro valor (é o que `interpolar` já fazia antes de
+            # existir histórico). Aplicamos aqui o mesmo perfil diurno do
+            # host, bem amortecido: a CPU do processo acompanha um pouco o
+            # movimento de almoço/jantar; a RSS fica só com o jitter (memória
+            # de um processo estável não "respira" com o tráfego do jeito
+            # que a CPU respira).
+            if INICIO <= horario <= FIM:
+                cpu_base = cpu(horario)
+            else:
+                cpu_base = cpu(horario) * amortecer_fator(fator_diurno(horario), 0.3)
+
             # Jitter pequeno: o número do cenário (40% -> 98%) é o oficial, mas
             # um processo real nunca fica parado exatamente no mesmo valor.
-            cpu_percent = round(cpu(horario) + aleatorio.uniform(-0.4, 0.4), 2)
+            cpu_percent = round(cpu_base + aleatorio.uniform(-0.4, 0.4), 2)
             rss_gb = max(0.001, rss(horario) + aleatorio.uniform(-0.02, 0.02))
             rss_bytes = int(rss_gb * (1024 ** 3))
             # O psutil calcula a porcentagem sobre bytes, então o denominador
@@ -1335,14 +1655,69 @@ def gerar_linhas_processos():
 # ===========================================================================
 
 
-def linhas_do_container(container, servidor, estado):
-    """Gera as linhas de um container.
+def progresso_host(ancoras, timestamp):
+    """0.0 no primeiro valor da curva do host, 1.0 no último - usado pra
+    mapear "onde o host está no incidente" num container que o acompanha."""
+    valor = curva(ancoras)(timestamp)
+    base, topo = ancoras[0][2], ancoras[-1][2]
+    if topo == base:
+        return 0.0
+    return max(0.0, min(1.0, (valor - base) / (topo - base)))
 
-    O comportamento do coupon-sync (2 reinicializações e encerramento final)
-    vem do cenário mestre, seção 7. Os contadores acumulados de rede e disco
-    zeram a cada reinicialização (o container reinicia, o cgroup recomeça) e o
-    container que encerrou aparece uma última linha com o estado "exited" e o
-    código de saída - depois disso ele para de reportar.
+
+def fator_atividade_container(servidor, chave_ancora_host, fracao_historica, episodios, timestamp):
+    """Fração do valor FINAL do container (cenário mestre, seção 7; 1.0 =
+    valor oficial em 20h30) que vale neste instante.
+
+    - Dentro da janela narrada, se o container acompanha uma âncora do host
+      (`chave_ancora_host`): sobe de `fracao_historica` até 1.0 seguindo o
+      PROGRESSO da curva do host (seção B do cenário Docker V2: "garanta
+      coerência entre containers e hosts em todos os instantes"). Em 20h30
+      o progresso é sempre 1.0, então o valor oficial nunca muda.
+    - Dentro de um episódio histórico pontual (seção 4.1): sobe/desce entre
+      `fracao_historica` e a fração de pico do episódio.
+    - Fora dos dois casos: `fracao_historica`, com um perfil diurno leve
+      quando o container de fato acompanha alguma âncora do host (senão
+      fica estável - é o caso do coupon-sync, que não tem história de
+      pressão, só de falha).
+    """
+    ancoras_host = servidor.get(chave_ancora_host) if chave_ancora_host else None
+
+    if ancoras_host and INICIO <= timestamp <= FIM:
+        progresso = progresso_host(ancoras_host, timestamp)
+        return fracao_historica + progresso * (1 - fracao_historica)
+
+    for inicio_ep, fim_ep, fracao_pico in episodios:
+        if inicio_ep <= timestamp <= fim_ep:
+            meio = inicio_ep + (fim_ep - inicio_ep) / 2
+            subindo = curva_absoluta([(inicio_ep, fracao_historica), (meio, fracao_pico)])
+            descendo = curva_absoluta([(meio, fracao_pico), (fim_ep, fracao_historica)])
+            valor = subindo(timestamp)
+            return valor if valor is not None else descendo(timestamp)
+
+    if not ancoras_host:
+        return fracao_historica
+
+    return fracao_historica * amortecer_fator(fator_diurno(timestamp), 0.5)
+
+
+def throttling_ativo(janelas, timestamp):
+    return any(inicio <= timestamp <= fim for inicio, fim in janelas)
+
+
+def linhas_do_container(container, servidor, estado):
+    """Gera as linhas de um container ao longo de toda a janela (histórico
+    de até 30 dias + a janela narrada).
+
+    O comportamento do coupon-sync (2 reinicializações e encerramento final
+    em 27/11, seção 7 do cenário mestre) continua vindo só desses dois
+    horários - o episódio recuperável de 24/11 (seção 4 do cenário Docker
+    V2) não entra aqui, só em `gerar_linhas_eventos`/`gerar_linhas_logs`, pra
+    não alterar o total de 2 reinicializações acumuladas. Os contadores
+    acumulados de rede/disco/throttling zeram a cada reinicialização (o
+    cgroup recomeça) e o container que encerrou aparece uma última linha com
+    o estado "exited" e o código de saída - depois disso ele para de
+    reportar.
     """
     aleatorio = gerador_aleatorio(f"container-{servidor['mac']}-{container['nome']}")
 
@@ -1356,8 +1731,19 @@ def linhas_do_container(container, servidor, estado):
     reinicios = container.get("reinicios", [])
     encerramento = container.get("encerramento")
 
-    # Começo do container: antes da janela (o container já estava de pé).
-    inicio = INICIO - timedelta(hours=8)
+    chave_ancora_cpu = container.get("ancora_cpu_host")
+    fracao_historica_cpu = container.get("fracao_historica_cpu", 1.0)
+    episodios_cpu = container.get("episodios_cpu", [])
+
+    chave_ancora_ram = container.get("ancora_ram_host")
+    fracao_historica_ram = container.get("fracao_historica_ram")
+    episodios_ram = container.get("episodios_ram", [])
+
+    janelas_throttling = container.get("janelas_throttling", [])
+
+    # Começo do container: antes do início do histórico (ele já estava de
+    # pé havia tempo).
+    inicio = INICIO_HISTORICO - timedelta(hours=8)
 
     # Contadores acumulados (o Docker conta desde o start da instância).
     cpu_total = 0
@@ -1366,28 +1752,23 @@ def linhas_do_container(container, servidor, estado):
     rede_enviada = 0
     disco_leitura = 0
     disco_escrita = 0
+    cpu_throttled_periods = 0
+    cpu_throttled_time = 0.0
 
-    # Tempo de CPU do sistema por minuto (8 núcleos x 60 segundos em ns).
+    # Tempo de CPU do sistema por minuto (núcleos x INTERVALO_SEGUNDOS em ns).
     delta_sistema = nucleos * 1_000_000_000 * INTERVALO_SEGUNDOS
 
     linhas = []
     for horario in horarios_da_janela():
-        if encerramento is not None:
-            hora_encerramento = datetime(2026, 11, 27, encerramento[0], encerramento[1])
-            if horario > hora_encerramento:
-                # Container encerrado: ele não reporta mais nada.
-                break
+        if encerramento is not None and horario > encerramento:
+            # Container encerrado: ele não reporta mais nada.
+            break
 
         # Reinicializações: a partir do horário do restart, o container roda
         # com o contador de reinícios maior e os contadores acumulados zeram.
-        reinicios_ate_agora = [
-            reinicio for reinicio in reinicios
-            if datetime(2026, 11, 27, reinicio[0], reinicio[1]) <= horario
-        ]
+        reinicios_ate_agora = [reinicio for reinicio in reinicios if reinicio <= horario]
         if reinicios_ate_agora:
-            ultimo_reinicio = datetime(
-                2026, 11, 27, reinicios_ate_agora[-1][0], reinicios_ate_agora[-1][1]
-            )
+            ultimo_reinicio = reinicios_ate_agora[-1]
             if estado["momento_reinicio"] != ultimo_reinicio:
                 estado["momento_reinicio"] = ultimo_reinicio
                 estado["zera_contadores"] = True
@@ -1401,12 +1782,12 @@ def linhas_do_container(container, servidor, estado):
             rede_enviada = 0
             disco_leitura = 0
             disco_escrita = 0
+            cpu_throttled_periods = 0
+            cpu_throttled_time = 0.0
             estado["zera_contadores"] = False
 
         # Estado do container neste momento.
-        encerrado = encerramento is not None and horario >= datetime(
-            2026, 11, 27, encerramento[0], encerramento[1]
-        )
+        encerrado = encerramento is not None and horario >= encerramento
 
         if encerrado:
             # Container parado: o agente de Docker ainda o lista (containers.list
@@ -1421,15 +1802,15 @@ def linhas_do_container(container, servidor, estado):
                 "HEALTH_STATUS": None,
                 "RESTART_COUNT": len(reinicios),
                 "STARTED_AT": para_timestamp_iso(estado["momento_reinicio"] or inicio),
-                "FINISHED_AT": para_timestamp_iso(datetime(2026, 11, 27, encerramento[0], encerramento[1])),
+                "FINISHED_AT": para_timestamp_iso(encerramento),
                 "EXIT_CODE": container.get("codigo_saida", 1),
                 "OOM_KILLED": False,
                 "CPU_PERCENT": None,
                 "CPU_TOTAL_USAGE": cpu_total,
                 "CPU_SYSTEM_USAGE": cpu_sistema,
                 "CPU_ONLINE_CPUS": nucleos,
-                "CPU_THROTTLED_TIME": 0.0,
-                "CPU_THROTTLED_PERIODS": 0,
+                "CPU_THROTTLED_TIME": round(cpu_throttled_time, 6),
+                "CPU_THROTTLED_PERIODS": cpu_throttled_periods,
                 "RAM_PERCENT": None,
                 "RAM_USAGE_BYTES": None,
                 "RAM_LIMIT_BYTES": limite_ram,
@@ -1447,20 +1828,45 @@ def linhas_do_container(container, servidor, estado):
             })
             continue
 
-        # Container em execução.
-        cpu_percent = round(
-            container["cpu_percent"] * (1 + aleatorio.uniform(-0.03, 0.03)), 2
+        # Container em execução: a fração de atividade escala CPU, PIDs,
+        # rede e disco juntos (curvas correlacionadas, mas com jitter
+        # independente - seção B: "distintas, mas correlacionadas"). RAM usa
+        # sua própria fração quando o container tem episódios de memória
+        # próprios (pay-api-java); os demais seguem a mesma fração da CPU,
+        # bem amortecida (memória reage mais devagar que CPU).
+        fator_cpu = fator_atividade_container(
+            servidor, chave_ancora_cpu, fracao_historica_cpu, episodios_cpu, horario
         )
-        ram_gb = max(0.05, container["ram_gib"] + aleatorio.uniform(-0.06, 0.06))
+        if chave_ancora_ram or fracao_historica_ram is not None:
+            fator_ram = fator_atividade_container(
+                servidor, chave_ancora_ram, fracao_historica_ram, episodios_ram, horario
+            )
+        else:
+            fator_ram = amortecer_fator(fator_cpu, 0.25)
+
+        cpu_percent = round(
+            container["cpu_percent"] * fator_cpu * (1 + aleatorio.uniform(-0.03, 0.03)), 2
+        )
+        ram_gb = max(0.05, container["ram_gib"] * fator_ram + aleatorio.uniform(-0.06, 0.06))
         ram_bytes = int(ram_gb * (1024 ** 3))
         ram_percent = round(ram_bytes / limite_ram * 100, 2)
 
-        cpu_total += int((cpu_percent / 100) / nucleos * delta_sistema)
+        cpu_total += int(max(0.0, cpu_percent) / 100 / nucleos * delta_sistema)
         cpu_sistema += delta_sistema
-        rede_recebida += int(container["rede_mb_s"][0] * 1024 * 1024 * INTERVALO_SEGUNDOS)
-        rede_enviada += int(container["rede_mb_s"][1] * 1024 * 1024 * INTERVALO_SEGUNDOS)
-        disco_leitura += int(container["disco_mb_s"][0] * 1024 * 1024 * INTERVALO_SEGUNDOS)
-        disco_escrita += int(container["disco_mb_s"][1] * 1024 * 1024 * INTERVALO_SEGUNDOS)
+        rede_recebida += int(container["rede_mb_s"][0] * fator_cpu * 1024 * 1024 * INTERVALO_SEGUNDOS)
+        rede_enviada += int(container["rede_mb_s"][1] * fator_cpu * 1024 * 1024 * INTERVALO_SEGUNDOS)
+        disco_leitura += int(container["disco_mb_s"][0] * fator_cpu * 1024 * 1024 * INTERVALO_SEGUNDOS)
+        disco_escrita += int(container["disco_mb_s"][1] * fator_cpu * 1024 * 1024 * INTERVALO_SEGUNDOS)
+
+        # Throttling: só nas janelas calibradas (seção 7 do cenário Docker
+        # V2 - nunca derivado da CPU instantânea). Fora delas, zero
+        # legítimo. Quota simulada: ~7 dos 8 núcleos lógicos por período de
+        # 100ms: quando o container está numa janela de throttling, alguns
+        # períodos daquele minuto estouram a quota e ficam limitados.
+        if janelas_throttling and throttling_ativo(janelas_throttling, horario):
+            periodos_novos = aleatorio.randint(1, 4)
+            cpu_throttled_periods += periodos_novos
+            cpu_throttled_time += periodos_novos * aleatorio.uniform(0.02, 0.08)
 
         linhas.append({
             "TIMESTAMP": para_timestamp_iso(horario),
@@ -1479,8 +1885,8 @@ def linhas_do_container(container, servidor, estado):
             "CPU_TOTAL_USAGE": cpu_total,
             "CPU_SYSTEM_USAGE": cpu_sistema,
             "CPU_ONLINE_CPUS": nucleos,
-            "CPU_THROTTLED_TIME": 0.0,
-            "CPU_THROTTLED_PERIODS": 0,
+            "CPU_THROTTLED_TIME": round(cpu_throttled_time, 6),
+            "CPU_THROTTLED_PERIODS": cpu_throttled_periods,
             "RAM_PERCENT": ram_percent,
             "RAM_USAGE_BYTES": ram_bytes,
             "RAM_LIMIT_BYTES": limite_ram,
@@ -1494,7 +1900,7 @@ def linhas_do_container(container, servidor, estado):
             "DISCO_ESCRITA_BYTES": disco_escrita,
             "CAMADA_GRAVAVEL_BYTES": camada_gravavel,
             "IMAGEM_SIZE_BYTES": tamanho_imagem,
-            "PIDS_CURRENT": container["pids"] + aleatorio.randint(-2, 2),
+            "PIDS_CURRENT": max(1, round(container["pids"] * fator_cpu)) + aleatorio.randint(-2, 2),
         })
 
     return linhas
@@ -1512,14 +1918,198 @@ def gerar_linhas_containers():
 
 
 # ===========================================================================
+# 12.1. Eventos e logs do Docker (seção C do cenário Docker V2)
+# ===========================================================================
+#
+# Eventos e logs compartilham a MESMA cronologia dos containers: os únicos
+# die/start que existem são os das duas reinicializações + o encerramento
+# final do coupon-sync em 27/11 (seção 7 do cenário mestre, já em
+# CONTAINERS). Nenhum outro container reinicia ou cai. Um "restart" visto de
+# fora é sempre um par die -> start - nunca geramos as duas ações pro mesmo
+# evento nem contamos a mesma tentativa duas vezes (seção C do prompt).
+#
+# (container, timestamp, acao, codigo_saida) - codigo_saida é None pra start.
+EVENTOS_NARRADOS = [
+    ("coupon-sync", datetime(2026, 11, 27, 20, 11, 1), "die", 1),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 11, 4), "start", None),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 16, 10), "die", 1),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 16, 14), "start", None),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 18, 0), "die", 1),
+]
+
+# (container, timestamp, nivel, mensagem) - mensagens da seção 8 do cenário
+# Docker V2, adaptadas ao formato do coletor real (capturas/containers/
+# logs.py: LOG_LEVEL + LOG_MENSAGEM). Os horários respeitam a ordem causal
+# exigida pela seção C: o ERROR de falha vem antes do die, o INFO de retomada
+# vem depois do start.
+LOGS_NARRADOS = [
+    ("cart-api-java", datetime(2026, 11, 27, 19, 46, 18), "WARN",
+     "Tempo de processamento acima do esperado"),
+    ("cart-api-java", datetime(2026, 11, 27, 20, 5, 12), "WARN",
+     "Fila interna de tarefas em crescimento"),
+    ("cart-api-java", datetime(2026, 11, 27, 20, 9, 31), "ERROR",
+     "Timeout ao consultar serviço de cupons"),
+    ("cart-api-java", datetime(2026, 11, 27, 20, 22, 8), "WARN",
+     "Fila interna de tarefas acima do padrão"),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 11, 0), "ERROR",
+     "Falha na sincronização de cupons"),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 11, 5), "INFO",
+     "Serviço iniciado novamente"),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 16, 9), "ERROR",
+     "Nova falha na sincronização"),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 16, 15), "INFO",
+     "Serviço iniciado novamente"),
+    ("coupon-sync", datetime(2026, 11, 27, 20, 17, 58), "ERROR",
+     "Encerramento da aplicação"),
+    ("pay-api-java", datetime(2026, 11, 27, 19, 28, 32), "WARN",
+     "Fila de processamento acima do padrão"),
+    ("pay-api-java", datetime(2026, 11, 27, 19, 46, 15), "WARN",
+     "Pressão de memória durante processamento"),
+    ("pay-retry-worker", datetime(2026, 11, 27, 20, 4, 27), "WARN",
+     "Tempo de processamento acima do esperado"),
+    # 24/11: episódio recuperável do coupon-sync, SEM reinício de container
+    # (seção 2 do prompt - "alternativa conservadora: evento histórico de
+    # instabilidade recuperável sem reinício" - preserva o acumulado oficial
+    # de 2 reinicializações na Black Friday). Por isso não há entrada
+    # correspondente em EVENTOS_NARRADOS: nada de "die"/"start" aconteceu.
+    ("coupon-sync", datetime(2026, 11, 24, 19, 12, 0), "WARN",
+     "Latência elevada na sincronização de cupons"),
+    ("coupon-sync", datetime(2026, 11, 24, 19, 15, 30), "ERROR",
+     "Falha transitória na sincronização de cupons"),
+    ("coupon-sync", datetime(2026, 11, 24, 19, 17, 45), "INFO",
+     "Sincronização recuperada automaticamente"),
+]
+
+# Um WARN perto do pico de cada episódio histórico calibrado (seção 11/12) -
+# mesma regra da seção 8 ("WARN em pressão/filas"), só que fora da noite da
+# Black Friday. O pico de 12/11 (recuperação espontânea, sem fila) não entra
+# aqui de propósito - é o contraste "sem instabilidade persistente" do
+# cenário.
+LOGS_EPISODIOS = [
+    # O índice 0 (pico de 12/11) fica de fora: "recuperação espontânea", sem
+    # fila - é o contraste proposital com os episódios seguintes.
+    ("cart-api-java", EPISODIOS_CART_API_JAVA[1:], "Fila interna de tarefas em crescimento"),
+    ("pay-api-java", EPISODIOS_PAY_API_JAVA_RAM, "Pressão de memória durante processamento"),
+    ("pay-retry-worker", EPISODIOS_PAY_RETRY_WORKER_RAM, "Fila de processamento acima do padrão"),
+]
+
+# INFO de rotina - esparso (um punhado de linhas por dia, não uma por
+# minuto - seção 8) para todos os sete containers, enquanto estiverem ativos.
+MENSAGENS_ROTINA = {
+    "pay-api-java": "Processamento de pagamentos concluído",
+    "pay-gateway-node": "Sincronização com gateway externo concluída",
+    "pay-retry-worker": "Fila de tentativas processada",
+    "cart-api-java": "Requisições de carrinho processadas",
+    "cart-worker-node": "Tarefa auxiliar concluída",
+    "redis-cache": "Verificação de integridade do cache concluída",
+    "coupon-sync": "Sincronização periódica de cupons concluída",
+}
+
+
+def _info_do_container(nome_container):
+    """(mac, container_id, servidor, container) a partir só do nome - os
+    sete containers do cenário têm nomes únicos entre si."""
+    for nome_servidor, containers in CONTAINERS.items():
+        for container in containers:
+            if container["nome"] == nome_container:
+                servidor = SERVIDORES_POR_NOME[nome_servidor]
+                return servidor["mac"], id_do_container(servidor["mac"], nome_container), servidor, container
+    raise KeyError(nome_container)
+
+
+def gerar_linhas_eventos():
+    """Eventos de ciclo de vida dos containers, no formato real do coletor
+    (capturas/containers/eventos.py: COLUNAS_EVENTOS + `descrever_evento`).
+    """
+    linhas = []
+    for nome_container, timestamp, acao, codigo_saida in EVENTOS_NARRADOS:
+        if not (INICIO_HISTORICO <= timestamp <= FIM):
+            continue
+        mac, container_id, _servidor, _container = _info_do_container(nome_container)
+        atributos = {"exitCode": codigo_saida} if codigo_saida is not None else {}
+        linhas.append({
+            "TIMESTAMP": para_timestamp_iso(timestamp),
+            "ENDERECO_MAC": mac,
+            "EVENT_ID": hashlib.sha256(
+                f"{container_id}-{acao}-{timestamp.isoformat()}".encode("utf-8")
+            ).hexdigest(),
+            "CONTAINER_ID": container_id,
+            "CONTAINER": nome_container,
+            "EVENT_TYPE": "container",
+            "EVENT_ACTION": acao,
+            "EVENT_DETAILS": descrever_evento(acao, atributos),
+            "EXIT_CODE": codigo_saida,
+        })
+    linhas.sort(key=lambda linha: linha["TIMESTAMP"])
+    return linhas
+
+
+def gerar_linhas_logs():
+    """Logs dos containers: as mensagens narradas (seção 8) + WARN perto dos
+    episódios históricos calibrados + INFO esparso de rotina. Nenhuma linha
+    nova depois do encerramento definitivo de um container (seção C)."""
+    linhas = []
+
+    def adicionar(nome_container, timestamp, nivel, mensagem):
+        if not (INICIO_HISTORICO <= timestamp <= FIM):
+            return
+        mac, container_id, _servidor, container_info = _info_do_container(nome_container)
+        encerramento = container_info.get("encerramento")
+        if encerramento is not None and timestamp > encerramento:
+            return
+        linhas.append({
+            "TIMESTAMP": para_timestamp_iso(timestamp),
+            "ENDERECO_MAC": mac,
+            "CONTAINER_ID": container_id,
+            "CONTAINER": nome_container,
+            "LOG_LEVEL": nivel,
+            "LOG_MENSAGEM": mensagem,
+        })
+
+    for nome_container, timestamp, nivel, mensagem in LOGS_NARRADOS:
+        adicionar(nome_container, timestamp, nivel, mensagem)
+
+    for nome_container, episodios, mensagem in LOGS_EPISODIOS:
+        for inicio_ep, fim_ep, _pico in episodios:
+            adicionar(nome_container, inicio_ep + (fim_ep - inicio_ep) / 2, "WARN", mensagem)
+
+    for nome_container, mensagem in MENSAGENS_ROTINA.items():
+        _mac, _container_id, _servidor, container_info = _info_do_container(nome_container)
+        aleatorio = gerador_aleatorio(f"logs-rotina-{nome_container}")
+        encerramento = container_info.get("encerramento")
+        fim_janela = min(FIM, encerramento) if encerramento else FIM
+
+        dia = INICIO_HISTORICO.replace(hour=0, minute=0, second=0, microsecond=0)
+        while dia <= fim_janela:
+            # Um horário comercial aleatório por dia, determinístico por
+            # container (mesma semente -> mesmo resultado em duas execuções).
+            minuto_do_dia = aleatorio.randint(6 * 60, 22 * 60)
+            timestamp = dia + timedelta(minutes=minuto_do_dia)
+            if INICIO_HISTORICO <= timestamp <= fim_janela:
+                adicionar(nome_container, timestamp, "INFO", mensagem)
+            dia += timedelta(days=1)
+
+    linhas.sort(key=lambda linha: linha["TIMESTAMP"])
+    return linhas
+
+
+# ===========================================================================
 # 13. CSV e upload
 # ===========================================================================
 
 
-def montar_csv(linhas, colunas):
-    """Monta o conteúdo do CSV na memória (nada é escrito em disco)."""
+def montar_csv(linhas, colunas, delimitador=","):
+    """Monta o conteúdo do CSV na memória (nada é escrito em disco).
+
+    Métricas/processos/containers usam ',' (como já era). Logs e eventos
+    usam ';', igual ao agente real (capturas/captura_docker.py) - a Silver
+    detecta o delimitador de cada arquivo automaticamente (`sep=None` no
+    pandas), então os dois formatos convivem sem conflito.
+    """
     buffer = io.StringIO()
-    escritor = csv.DictWriter(buffer, fieldnames=colunas, extrasaction="raise")
+    escritor = csv.DictWriter(
+        buffer, fieldnames=colunas, extrasaction="raise", delimiter=delimitador
+    )
     escritor.writeheader()
     for linha in linhas:
         faltando = [coluna for coluna in colunas if coluna not in linha]
@@ -1532,7 +2122,7 @@ def montar_csv(linhas, colunas):
     return buffer.getvalue()
 
 
-def enviar_para_s3(conteudo, nome_arquivo, prefixo, bucket):
+def enviar_para_s3(conteudo, nome_arquivo, prefixo, bucket, cliente=None):
     """Sobe o CSV para o S3 de verdade, no prefixo raw/.
 
     As credenciais vêm do próprio ambiente (a sessão do AWS CLI / AWS Academy
@@ -1541,7 +2131,7 @@ def enviar_para_s3(conteudo, nome_arquivo, prefixo, bucket):
     """
     import boto3
 
-    cliente = boto3.client("s3")
+    cliente = cliente or boto3.client("s3")
     chave = f"{prefixo}/{nome_arquivo}"
 
     cliente.put_object(
@@ -1732,7 +2322,263 @@ def conferir_cenario(linhas_metricas):
 # ===========================================================================
 
 
+def validar_cobertura(horarios):
+    """Checagens da seção 4.1 do relatório: ordenação, ausência de
+    duplicidade, amostragem de INTERVALO_SEGUNDOS e contagem de dias civis
+    tocados pela janela. Não corrige nada - só relata."""
+    problemas = []
+    if horarios != sorted(horarios):
+        problemas.append("instantes fora de ordem")
+    if len(set(horarios)) != len(horarios):
+        problemas.append("instantes duplicados")
+    passos = {
+        (b - a).total_seconds() for a, b in zip(horarios, horarios[1:])
+    }
+    if passos and passos != {float(INTERVALO_SEGUNDOS)}:
+        problemas.append(f"amostragem irregular: passos distintos de {INTERVALO_SEGUNDOS}s -> {sorted(passos)}")
+    dias_civis = {horario.date() for horario in horarios}
+    print(
+        f"  cobertura: {len(horarios)} instantes, {horarios[0]} a {horarios[-1]}, "
+        f"{len(dias_civis)} dias civis distintos"
+    )
+    return problemas
+
+
+def contar_reinicios_coupon_sync(linhas_eventos):
+    """Reconciliação pedida na seção 4/6 do relatório: reinicializações
+    (pares die+start) no dia 27/11 vs nos últimos 7 dias vs no total gerado.
+    `die` sem `start` seguinte (o encerramento final) não conta como
+    reinicialização."""
+    dies = sorted(
+        datetime.fromisoformat(linha["TIMESTAMP"].replace("Z", "+00:00"))
+        for linha in linhas_eventos
+        if linha["CONTAINER"] == "coupon-sync" and linha["EVENT_ACTION"] == "die"
+    )
+    starts = sorted(
+        datetime.fromisoformat(linha["TIMESTAMP"].replace("Z", "+00:00"))
+        for linha in linhas_eventos
+        if linha["CONTAINER"] == "coupon-sync" and linha["EVENT_ACTION"] == "start"
+    )
+    reinicios = [die for die in dies if any(die < start for start in starts)]
+
+    fim_utc = para_utc(FIM)
+    janela_7d = fim_utc - timedelta(days=7)
+    inicio_27_11_utc = para_utc(datetime(2026, 11, 27, 0, 0))
+
+    no_dia_27 = [r for r in reinicios if r >= inicio_27_11_utc]
+    em_7d = [r for r in reinicios if r >= janela_7d]
+    print(
+        f"  coupon-sync: {len(reinicios)} reinicializações no total gerado, "
+        f"{len(em_7d)} nos últimos 7 dias (a partir de {janela_7d.isoformat()}), "
+        f"{len(no_dia_27)} em 27/11 (esperado: 2)"
+    )
+    return reinicios
+
+
+def dividir_em_lotes(categorias, dias_por_lote):
+    """Particiona por dias civis, sem regenerar, copiar ou alterar registros."""
+    fuso = ZoneInfo("America/Sao_Paulo")
+    primeiro_dia = INICIO_HISTORICO.date()
+    lotes = {}
+    for nome, (linhas, _, _, _) in categorias.items():
+        for linha in linhas:
+            instante = datetime.fromisoformat(linha["TIMESTAMP"].replace("Z", "+00:00"))
+            if instante.tzinfo is None:
+                instante = instante.replace(tzinfo=fuso)
+            dia = instante.astimezone(fuso).date()
+            inicio = primeiro_dia + timedelta(
+                days=((dia - primeiro_dia).days // dias_por_lote) * dias_por_lote
+            )
+            lote = lotes.setdefault(inicio, {categoria: [] for categoria in categorias})
+            lote[nome].append(linha)
+    return dict(sorted(lotes.items()))
+
+
+def nome_arquivo_lote(nome, inicio, dias_por_lote, conteudo):
+    # A identidade inclui o conteúdo: repetir a mesma execução sobrescreve a
+    # mesma chave, inclusive numa retomada após upload parcial.
+    digest = hashlib.sha256(conteudo.encode("utf-8")).hexdigest()
+    return f"{nome}_{inicio:%Y%m%d}T000000_{dias_por_lote}d_{digest}.csv"
+
+
+def verificar_gatilhos(sessao, s3, cliente_lambda, bucket, nome_lambda):
+    """Preflight somente leitura. Falta de permissão também impede o envio.
+
+    Notificações indiretas (SNS/SQS/EventBridge) são bloqueadas de forma
+    conservadora: este script não consegue provar que não disparam a esteira.
+    A verificação é um retrato da configuração, não um lock distribuído.
+    """
+    configuracao = cliente_lambda.get_function_configuration(FunctionName=nome_lambda)
+    arn = configuracao["FunctionArn"].split(":")
+    arn = ":".join(arn[:7])  # inclui function:nome, sem versão/alias
+    notificacoes = s3.get_bucket_notification_configuration(Bucket=bucket)
+    conflitos = []
+    for campo in ("LambdaFunctionConfigurations", "QueueConfigurations", "TopicConfigurations"):
+        if notificacoes.get(campo):
+            conflitos.append(f"S3: {campo}")
+    if "EventBridgeConfiguration" in notificacoes:
+        conflitos.append("S3: notificações EventBridge habilitadas")
+
+    def mesma_funcao(alvo):
+        return alvo == arn or alvo.startswith(arn + ":")
+
+    for pagina in cliente_lambda.get_paginator("list_event_source_mappings").paginate(FunctionName=arn):
+        for origem in pagina.get("EventSourceMappings", []):
+            if origem.get("State") != "Disabled":
+                conflitos.append(f"event source mapping: {origem['UUID']}")
+
+    eventos = sessao.client("events")
+
+    def paginas_barramentos():
+        parametros = {}
+        while True:
+            pagina = eventos.list_event_buses(**parametros)
+            yield pagina
+            if not pagina.get("NextToken"):
+                return
+            parametros["NextToken"] = pagina["NextToken"]
+
+    for pagina in paginas_barramentos():
+        for barramento in pagina.get("EventBuses", []):
+            for regras in eventos.get_paginator("list_rules").paginate(EventBusName=barramento["Name"]):
+                for regra in regras.get("Rules", []):
+                    if regra.get("State") == "DISABLED":
+                        continue
+                    for alvos in eventos.get_paginator("list_targets_by_rule").paginate(
+                        Rule=regra["Name"], EventBusName=barramento["Name"]
+                    ):
+                        if any(mesma_funcao(alvo["Arn"]) for alvo in alvos.get("Targets", [])):
+                            conflitos.append(f"EventBridge: {regra['Name']}")
+
+    scheduler = sessao.client("scheduler")
+    for pagina in scheduler.get_paginator("list_schedules").paginate():
+        for agenda in pagina.get("Schedules", []):
+            alvo = agenda.get("Target", {}).get("Arn", "")
+            if agenda.get("State") == "ENABLED" and (
+                mesma_funcao(alvo) or ":aws-sdk:lambda:invoke" in alvo
+            ):
+                conflitos.append(f"Scheduler: {agenda['GroupName']}/{agenda['Name']}")
+
+    # Impede execução simultânea mesmo se outro chamador surgir depois da
+    # verificação. Não altera a configuração da conta automaticamente.
+    concorrencia = cliente_lambda.get_function_concurrency(FunctionName=arn)
+    if concorrencia.get("ReservedConcurrentExecutions") != 1:
+        conflitos.append("configure a concorrência reservada da Lambda como 1 para esta carga")
+    if conflitos:
+        raise RuntimeError("Envio bloqueado por risco de concorrência: " + "; ".join(conflitos))
+    print("[AWS] Verificação concluída. Mantenha gatilhos suspensos e não execute outro produtor durante a carga.", flush=True)
+    return configuracao["Timeout"]
+
+
+def invocar_lambda(cliente, nome_lambda):
+    resposta = cliente.invoke(
+        FunctionName=nome_lambda, InvocationType="RequestResponse", Payload=b"{}"
+    )
+    corpo = resposta["Payload"]
+    try:
+        texto = corpo.read().decode("utf-8")
+    finally:
+        corpo.close()
+    if resposta.get("FunctionError") or resposta.get("StatusCode") != 200:
+        raise RuntimeError(f"Lambda falhou: {resposta.get('FunctionError')}: {texto[:2000]}")
+    resultado = json.loads(texto)
+    # Contrato do lambda_handler atual: statusCode=200 e body JSON.
+    if not isinstance(resultado, dict) or resultado.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda não confirmou sucesso: {texto[:2000]}")
+    corpo_resultado = resultado.get("body")
+    if isinstance(corpo_resultado, str):
+        try:
+            corpo_resultado = json.loads(corpo_resultado)
+        except ValueError:
+            raise RuntimeError(f"Resposta da Lambda fora do contrato: {texto[:2000]}")
+    for parte in (resultado, corpo_resultado):
+        if isinstance(parte, dict) and (
+            any(parte.get(chave) for chave in ("error", "errorMessage", "erro", "errors"))
+            or parte.get("success") is False
+            or ("statusCode" in parte and parte["statusCode"] != 200)
+        ):
+            raise RuntimeError(f"Erro no conteúdo da Lambda: {texto[:2000]}")
+    if corpo_resultado != "Pipeline Silver + Gold finalizado com sucesso!":
+        raise RuntimeError(f"Confirmação inesperada da Lambda: {texto[:2000]}")
+
+
+def executar_lotes(categorias, argumentos, inicio_execucao):
+    lotes = dividir_em_lotes(categorias, argumentos.dias_por_lote)
+    if argumentos.retomar_de and argumentos.retomar_de not in lotes:
+        raise ValueError("--retomar-de deve ser a data inicial de um lote, mantendo --dias-historico e --dias-por-lote originais")
+    selecionados = [(dia, lote) for dia, lote in lotes.items()
+                    if argumentos.retomar_de is None or dia >= argumentos.retomar_de]
+    bucket = os.environ.get("BUCKET_DESTINO")
+    cliente_s3 = cliente_lambda = None
+    if not argumentos.somente_local:
+        print("ATENÇÃO: a Gold atual ainda relê todo trusted/; os lotes não limitam o histórico reprocessado.", flush=True)
+        if not bucket:
+            raise ValueError("Defina BUCKET_DESTINO ou use --somente-local")
+        import boto3
+        from botocore.config import Config
+        # Uma tentativa total evita reexecuções automáticas após timeout de rede.
+        config = Config(connect_timeout=10, read_timeout=60,
+                        retries={"total_max_attempts": 1}, tcp_keepalive=True)
+        sessao = boto3.Session()
+        cliente_s3 = sessao.client("s3", config=config)
+        if argumentos.lambda_nome:
+            cliente_lambda = sessao.client("lambda", config=config)
+            timeout = verificar_gatilhos(sessao, cliente_s3, cliente_lambda, bucket, argumentos.lambda_nome)
+            cliente_lambda = sessao.client("lambda", config=config.merge(Config(read_timeout=timeout + 60)))
+        else:
+            print("ATENÇÃO: sem --lambda-nome, modo somente upload; nenhum processamento será confirmado.", flush=True)
+    else:
+        Path(argumentos.pasta).mkdir(parents=True, exist_ok=True)
+
+    concluidos = registros = arquivos = falhas = 0
+    try:
+        for indice, (dia, lote) in enumerate(selecionados, 1):
+            inicio_lote = time.monotonic()
+            print(f"\n[LOTE {indice:02}/{len(selecionados):02}] Data: {dia} (até {min(dia + timedelta(days=argumentos.dias_por_lote - 1), FIM.date())})", flush=True)
+            for nome, linhas in lote.items():
+                print(f"  {nome}: {len(linhas)} registros", flush=True)
+            try:
+                for nome, linhas in lote.items():
+                    if not linhas:
+                        continue
+                    _, colunas, delimitador, prefixo = categorias[nome]
+                    conteudo = montar_csv(linhas, colunas, delimitador)
+                    arquivo = nome_arquivo_lote(nome, dia, argumentos.dias_por_lote, conteudo)
+                    if argumentos.amostras > 0:
+                        print(f"--- amostra de {nome} ({arquivo}) ---")
+                        print("\n".join(conteudo.splitlines()[:argumentos.amostras + 1]))
+                    if argumentos.somente_local:
+                        destino = Path(argumentos.pasta) / arquivo
+                        destino.write_text(conteudo, encoding="utf-8")
+                        print(f"[local] Salvo: {destino}", flush=True)
+                    else:
+                        enviar_para_s3(conteudo, arquivo, prefixo, bucket, cliente=cliente_s3)
+                    arquivos += 1
+                    registros += len(linhas)
+                if cliente_lambda is not None:
+                    print("Upload concluído. Executando Lambda...", flush=True)
+                    invocar_lambda(cliente_lambda, argumentos.lambda_nome)
+                    print("Processamento concluído com sucesso.", flush=True)
+                concluidos += 1
+                print(f"Tempo total do lote: {time.monotonic() - inicio_lote:.1f}s", flush=True)
+                if not argumentos.somente_local and indice < len(selecionados):
+                    time.sleep(argumentos.intervalo_entre_lotes)
+            except (Exception, KeyboardInterrupt) as erro:
+                falhas += 1
+                print(f"FALHA no lote {dia}: {erro}\nRetome com --retomar-de {dia}, mantendo os demais parâmetros. "
+                      "Se a conexão caiu, confira a execução da Lambda antes de retomar; ela pode ainda estar em andamento.", flush=True)
+                return 1
+    finally:
+        modo = "salvos localmente" if argumentos.somente_local else "enviados"
+        print(f"\nResumo: {concluidos}/{len(selecionados)} lotes concluídos; "
+              f"{registros} registros e {arquivos} arquivos {modo}; {falhas} falhas; "
+              f"tempo total: {time.monotonic() - inicio_execucao:.1f}s. "
+              f"Processamento {'confirmado para os lotes concluídos' if cliente_lambda is not None else 'não confirmado (modo local/upload)'}.", flush=True)
+    return 0
+
+
 def main():
+    inicio_execucao = time.monotonic()
     analisador = argparse.ArgumentParser(
         description="Gera os CSVs do cenário Black Friday e sobe para o S3 (prefixo raw/)."
     )
@@ -1752,60 +2598,79 @@ def main():
         default=0,
         help="quantas linhas de cada CSV mostrar no console",
     )
+    analisador.add_argument(
+        "--dias-historico",
+        type=int,
+        default=DIAS_HISTORICO_PADRAO,
+        help=(
+            "quantos dias ANTES de 27/11 20h30 o gerador cobre (padrão: "
+            f"{DIAS_HISTORICO_PADRAO}). Use 0 pra gerar só a janela narrada "
+            "original (18h45-20h30 de 27/11), igual ao gerador antigo - útil "
+            "pra iterar rápido."
+        ),
+    )
+    analisador.add_argument("--dias-por-lote", type=int, default=1, help="dias civis por lote (padrão: 1)")
+    analisador.add_argument("--lambda-nome", help="Lambda Silver + Gold a invocar sincronamente")
+    analisador.add_argument("--intervalo-entre-lotes", type=float, default=0, help="pausa adicional em segundos; não confirma processamento")
+    analisador.add_argument("--retomar-de", type=date.fromisoformat, help="data inicial do lote a retomar (AAAA-MM-DD); preserve os outros parâmetros")
     argumentos = analisador.parse_args()
+    if argumentos.dias_por_lote < 1:
+        analisador.error("--dias-por-lote deve ser maior que zero")
+    if not math.isfinite(argumentos.intervalo_entre_lotes) or argumentos.intervalo_entre_lotes < 0:
+        analisador.error("--intervalo-entre-lotes deve ser finito e não negativo")
 
-    print("Gerando o cenário Black Friday (27/11/2026, 18h45 - 20h30)...")
+    if argumentos.dias_historico < 0:
+        print("ERRO: --dias-historico não pode ser negativo.")
+        return 1
+
+    global INICIO_HISTORICO
+    # min(...) garante que --dias-historico 0 ainda cobre a janela narrada
+    # inteira (18h45-20h30): "0 dias de histórico ALÉM da janela narrada",
+    # não "FIM menos zero dias" (que seria só o instante de referência).
+    INICIO_HISTORICO = min(INICIO, FIM - timedelta(days=argumentos.dias_historico))
+
+    print(
+        f"Gerando o cenário Black Friday: histórico de {argumentos.dias_historico} dia(s) "
+        f"({INICIO_HISTORICO} a {FIM}), incidente narrado em 27/11 18h45-20h30..."
+    )
 
     cabecalho = cabecalho_metricas()
     linhas_metricas = gerar_linhas_metricas()
     linhas_processos = gerar_linhas_processos()
     linhas_containers = gerar_linhas_containers()
-
-    conteudo_metricas = montar_csv(linhas_metricas, cabecalho)
-    conteudo_processos = montar_csv(linhas_processos, COLUNAS_PROCESSOS)
-    conteudo_containers = montar_csv(linhas_containers, COLUNAS_CONTAINERS)
+    linhas_eventos = gerar_linhas_eventos()
+    linhas_logs = gerar_linhas_logs()
 
     print(f"  métricas: {len(linhas_metricas)} linhas x {len(cabecalho)} colunas")
     print(f"  processos: {len(linhas_processos)} linhas x {len(COLUNAS_PROCESSOS)} colunas")
     print(f"  containers: {len(linhas_containers)} linhas x {len(COLUNAS_CONTAINERS)} colunas")
+    print(f"  eventos: {len(linhas_eventos)} linhas x {len(COLUNAS_EVENTOS)} colunas")
+    print(f"  logs: {len(linhas_logs)} linhas x {len(COLUNAS_LOGS)} colunas")
 
     problemas = conferir_cenario(linhas_metricas)
 
-    carimbo = datetime.now().strftime("%Y%m%dT%H%M%S")
-    arquivos = [
-        ("metricas", conteudo_metricas, f"metricas_{carimbo}.csv", PREFIXO_S3),
-        ("processos", conteudo_processos, f"processos_{carimbo}.csv", PREFIXO_S3),
-        ("containers", conteudo_containers, f"containers_{carimbo}.csv", PREFIXO_S3_CONTAINERS),
-    ]
+    print("\n" + "=" * 78)
+    print("VALIDAÇÃO DE COBERTURA E RECONCILIAÇÃO (seção 4 do relatório)")
+    print("=" * 78)
+    problemas.extend(validar_cobertura(horarios_da_janela()))
+    contar_reinicios_coupon_sync(linhas_eventos)
 
-    if argumentos.amostras > 0:
-        for nome, conteudo, arquivo, _ in arquivos:
-            print(f"\n--- amostra de {nome} ({arquivo}) ---")
-            for linha in conteudo.splitlines()[: argumentos.amostras + 1]:
-                print(linha)
-
-    if argumentos.somente_local:
-        pasta = Path(argumentos.pasta)
-        pasta.mkdir(parents=True, exist_ok=True)
-        for nome, conteudo, arquivo, _ in arquivos:
-            destino = pasta / arquivo
-            destino.write_text(conteudo, encoding="utf-8")
-            print(f"[local] Salvo: {destino}")
-        print("\nNão houve upload (--somente-local).")
-    else:
-        bucket = os.environ.get("BUCKET_DESTINO")
-        if not bucket:
-            print(
-                "ERRO: a variável de ambiente BUCKET_DESTINO não está definida.\n"
-                "      Exemplo: BUCKET_DESTINO=coretrace-teste-marcelly-757158332486 \\\n"
-                "               python ferramentas/gerador_dados_apresentacao.py\n"
-                "      (use --somente-local para gerar os CSVs sem subir para a AWS)"
-            )
-            return 1
-
-        print(f"\nEnviando para o bucket {bucket}...")
-        for nome, conteudo, arquivo, prefixo in arquivos:
-            enviar_para_s3(conteudo, arquivo, prefixo, bucket)
+    categorias = {
+        "metricas": (linhas_metricas, cabecalho, ",", PREFIXO_S3),
+        "processos": (linhas_processos, COLUNAS_PROCESSOS, ",", PREFIXO_S3),
+        "containers": (linhas_containers, COLUNAS_CONTAINERS, ",", PREFIXO_S3_CONTAINERS),
+        "eventos": (linhas_eventos, COLUNAS_EVENTOS, ";", PREFIXO_S3_EVENTOS),
+        "logs": (linhas_logs, COLUNAS_LOGS, ";", PREFIXO_S3_LOGS),
+    }
+    try:
+        resultado = executar_lotes(categorias, argumentos, inicio_execucao)
+    except Exception as erro:
+        print(f"ERRO antes do envio dos lotes: {erro}", flush=True)
+        print(f"Resumo: 0 lotes concluídos; 0 registros e 0 arquivos enviados; "
+              f"1 falha; tempo total: {time.monotonic() - inicio_execucao:.1f}s.", flush=True)
+        return 1
+    if resultado:
+        return resultado
 
     if problemas:
         print("\nATENÇÃO: confira os problemas listados acima antes de apresentar.")
