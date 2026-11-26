@@ -739,3 +739,157 @@ def estado_por_categoria(recursos_estado):
         if atual is None or PESOS_SEVERIDADE[item['estado']] > PESOS_SEVERIDADE[atual]:
             resultado[item['categoria']] = item['estado']
     return resultado
+
+
+# Processos têm escopo próprio (persona Amanda) e não entram no CATEGORIAS_SERVIDOR
+# do formato_gold.py: misturá-los com a CPU/RAM do host mudaria o contrato do resumo
+# usado pela dashboard de servidores. Este acumulador é paralelo ao
+# AcumuladorEstadoRecursos, mas agrupa por instância (pid, nome) em vez de recurso
+# físico, e guarda só o necessário para os KPIs de pico.
+class AcumuladorProcessos:
+    def __init__(self):
+        self.instancias = {}
+
+    def _leitura_valida(self, leitura):
+        # Mesma regra do resumir_leituras: status diferente de "ok" e null não entram.
+        # "aquecendo" e "indisponivel" ficam de fora, inclusive com valor preenchido.
+        if not isinstance(leitura, dict) or leitura.get('status') != 'ok':
+            return None
+        valor = leitura.get('valor')
+        if valor is None or isinstance(valor, bool):
+            return None
+        if not isinstance(valor, (int, float)) or not math.isfinite(valor):
+            return None
+        return valor
+
+    def adicionar(self, registro):
+        # O registro já vem organizado por organizar_processo.
+        pid = registro.get('pid')
+        nome = registro.get('nome')
+        if not isinstance(pid, int) or isinstance(pid, bool) or not nome:
+            return
+        instante = registro.get('timestamp')
+        if instante is None:
+            return
+
+        chave = (pid, nome)
+        instancia = self.instancias.get(chave)
+        if instancia is None:
+            instancia = {
+                'pid': pid, 'nome': nome,
+                'leituras_cpu': [], 'leituras_memoria': []
+            }
+            self.instancias[chave] = instancia
+
+        cpu = registro.get('cpu') or {}
+        valor_cpu = self._leitura_valida(cpu.get('uso'))
+        if valor_cpu is not None:
+            instancia['leituras_cpu'].append(
+                (instante_comparavel(instante), instante, valor_cpu)
+            )
+
+        memoria = registro.get('memoria') or {}
+        valor_memoria = self._leitura_valida(memoria.get('uso_percentual'))
+        if valor_memoria is not None:
+            instancia['leituras_memoria'].append(
+                (instante_comparavel(instante), instante, valor_memoria)
+            )
+
+    def _resumir_cpu(self, instancia):
+        # Ordenamos pelo instante real, não pela ordem de chegada dos lotes.
+        leituras = sorted(instancia['leituras_cpu'], key=lambda leitura: leitura[0])
+        if not leituras:
+            return None
+
+        pico = leituras[0][2]
+        instante_pico = leituras[0][1]
+        soma = 0
+        acima_100 = 0
+        for ns, instante, valor in leituras:
+            soma += valor
+            # Só troca com valor estritamente maior: em empate fica o primeiro instante.
+            if valor > pico:
+                pico = valor
+                instante_pico = instante
+            if valor > 100:
+                acima_100 += 1
+
+        return {
+            'pid': instancia['pid'],
+            'nome': instancia['nome'],
+            'pico_cpu_percent': pico,
+            'instante_pico': instante_iso_utc(instante_pico),
+            'media_cpu_percent': soma / len(leituras),
+            'segundos_acima_100': acima_100,
+            'amostras_validas': len(leituras),
+        }
+
+    def _resumir_memoria(self, instancia):
+        # Mesma ordem cronológica da CPU: o "último" não depende da ordem de chegada dos lotes.
+        leituras = sorted(instancia['leituras_memoria'], key=lambda leitura: leitura[0])
+        if not leituras:
+            return None
+
+        pico = leituras[0][2]
+        instante_pico = leituras[0][1]
+        minimo = leituras[0][2]
+        soma = 0
+        for ns, instante, valor in leituras:
+            soma += valor
+            # Em empate, fica o primeiro instante em que o pico foi atingido.
+            if valor > pico:
+                pico = valor
+                instante_pico = instante
+            if valor < minimo:
+                minimo = valor
+
+        # O coletor já arredonda a leitura em duas casas; a variação segue a mesma precisão.
+        ultimo = leituras[-1][2]
+        return {
+            'pid': instancia['pid'],
+            'nome': instancia['nome'],
+            'pico_memoria_percent': pico,
+            'instante_pico': instante_iso_utc(instante_pico),
+            'minimo_memoria_percent': minimo,
+            'ultimo_memoria_percent': ultimo,
+            # Crescer em relação ao mínimo ajuda a ver retenção sem depender do pico absoluto.
+            'variacao_memoria_percent': round(ultimo - minimo, 2),
+            'media_memoria_percent': soma / len(leituras),
+            'amostras_validas': len(leituras),
+        }
+
+    def calcular(self):
+        ranking_cpu = []
+        ranking_memoria = []
+        for instancia in self.instancias.values():
+            resumo_cpu = self._resumir_cpu(instancia)
+            if resumo_cpu is not None:
+                ranking_cpu.append(resumo_cpu)
+            resumo_memoria = self._resumir_memoria(instancia)
+            if resumo_memoria is not None:
+                ranking_memoria.append(resumo_memoria)
+
+        # Maior pico, depois mais tempo saturado, depois menor PID.
+        ranking_cpu.sort(key=lambda item: (
+            -item['pico_cpu_percent'],
+            -item['segundos_acima_100'],
+            item['pid'],
+        ))
+
+        # Maior pico de RAM, depois maior variação, depois menor PID.
+        ranking_memoria.sort(key=lambda item: (
+            -item['pico_memoria_percent'],
+            -item['variacao_memoria_percent'],
+            item['pid'],
+        ))
+
+        return {
+            'pico_cpu': {
+                'destaque': deepcopy(ranking_cpu[0]) if ranking_cpu else None,
+                'ranking': [deepcopy(item) for item in ranking_cpu[:5]],
+            },
+            'pico_memoria': {
+                'destaque': deepcopy(ranking_memoria[0]) if ranking_memoria else None,
+                'ranking': [deepcopy(item) for item in ranking_memoria[:5]],
+            }
+        }

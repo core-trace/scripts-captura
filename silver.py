@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from botocore.exceptions import ClientError
 
-BUCKET = "bucket-coretrace"
+BUCKET = "buckettavares"
 BRONZE = "raw/"
 SILVER = "trusted/"
 
@@ -268,7 +268,7 @@ def transformar_dados(df, tipo_arquivo):
 
             if not (
                 tipo_arquivo in ("processos", "docker_metricas")
-                and coluna.lower() == "cpu_percent"    
+                and coluna.lower() in ("cpu_percent", "p_cpu_percent")    
             ):
                 numeros = numeros.mask(numeros > 100)
 
@@ -363,7 +363,7 @@ def processar_arquivos():
 
                 tipo_arquivo = identificar_tipo(df)
 
-                # Relaciona cada tipo de arquivo à sua pasta na Silver.
+                # Relaciona cada tipo de arquivo à suncias ↓a pasta na Silver.
                 # Mantemos as pastas antigas e separamos os dados do Docker.
                 pastas_destino = {
                     "metricas": "metricas",

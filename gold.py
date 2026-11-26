@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from botocore.exceptions import ClientError
-from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, AcumuladorEstadoRecursos, AcumuladorPrevisao, calcular_severidade, piores_recursos, estado_por_categoria
+from resumos_gold import AcumuladorResumo, AcumuladorTempoNoEstado, AcumuladorEvolucao, AcumuladorEstadoRecursos, AcumuladorPrevisao, AcumuladorProcessos, calcular_severidade, piores_recursos, estado_por_categoria
 from formato_gold import (
     organizar_metricas,
     organizar_processo,
@@ -26,7 +26,7 @@ from formato_gold import (
     para_cada_medida_com_recurso
 )
 
-BUCKET = "bucket-coretrace"
+BUCKET = "buckettavares"
 SILVER = "trusted/"
 GOLD = "client/"
 
@@ -522,6 +522,7 @@ def processar_gold():
     evolucoes = {}  # (mac, data) -> AcumuladorEvolucao, mesma ideia do tempos_no_estado
     estados_recursos = {}  # (mac, data) -> AcumuladorEstadoRecursos, estado por núcleo/volume/interface
     previsoes = {}  # (mac, data) -> AcumuladorPrevisao, mesma ideia tambem
+    processos_kpis = {}  # (mac, data) -> AcumuladorProcessos, picos de CPU/RAM por processo
     tokens_por_mac = {}  # mac -> (token_instalacao, token_perfil_servidor), pra consultar limites depois
     envios = []
 
@@ -600,6 +601,7 @@ def processar_gold():
                                 evolucoes[chave_dia] = AcumuladorEvolucao()
                                 estados_recursos[chave_dia] = AcumuladorEstadoRecursos()
                                 previsoes[chave_dia] = AcumuladorPrevisao()
+                                processos_kpis[chave_dia] = AcumuladorProcessos()
                             acumulador = diarios[chave_dia]
                             acumulador_tempo = tempos_no_estado[chave_dia]
                             acumulador_evolucao = evolucoes[chave_dia]
@@ -636,6 +638,11 @@ def processar_gold():
                                     observacao[campo] = [registro]
                                     resumo = resumir_documento(observacao)
                                     acumulador.adicionar(resumo, registro["timestamp"])
+
+                                    # Processos ficam num acumulador separado: o resumo do
+                                    # servidor nao pode misturar CPU/RAM de processo com a do host.
+                                    if campo == "processos":
+                                        processos_kpis[chave_dia].adicionar(registro)
 
                                     # tempo no estado e evolucao real precisam das leituras cruas,
                                     # nao do resumo ja combinado la em cima, entao alimento os dois
@@ -756,6 +763,12 @@ def processar_gold():
                     diario["recursos_estado"] = estado_recursos
                     diario["piores_recursos"] = piores_recursos(estado_recursos)
                     diario["estado_por_categoria"] = estado_por_categoria(estado_recursos)
+                # KPIs de processo (Amanda) ficam isolados do resumo do servidor.
+                # Sem leitura valida, omitimos a chave em vez de gravar None.
+                kpis_processos = processos_kpis[(mac, data)].calcular()
+                if (kpis_processos["pico_cpu"]["destaque"] is not None or
+                        kpis_processos["pico_memoria"]["destaque"] is not None):
+                    diario["kpis_processos"] = kpis_processos
                 destino = f"{GOLD}resumos/maquina={mac}/data={data}/resumo.json"
                 preparar_envio(pasta, envios, destino, diario)
 
