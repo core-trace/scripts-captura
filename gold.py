@@ -649,7 +649,16 @@ def processar_gold():
                                             status = leitura.get("status")
                                             acumulador_tempo.adicionar(metrica, instante, valor, status)
                                             acumulador_evolucao.adicionar(metrica, instante, valor, status)
-                                            acumulador_previsao.adicionar(metrica, instante, valor, status)
+                                            # cpu_percent_percpu manda uma leitura por nucleo logico na mesma
+                                            # captura, e o AcumuladorPrevisao guarda so por nome da metrica,
+                                            # sem separar por recurso - leituras de nucleos diferentes cairiam
+                                            # juntas na mesma serie e a tendencia sairia misturada entre
+                                            # nucleos. Por enquanto, so alimentamos previsao pra metricas que
+                                            # tem 1 leitura por servidor (disk_percent tambem "tem recurso" - o
+                                            # volume - mas como cada servidor so tem 1 volume no cenario atual,
+                                            # nao ha mistura de verdade ali).
+                                            if metrica != "cpu_percent_percpu":
+                                                acumulador_previsao.adicionar(metrica, instante, valor, status)
 
                                         para_cada_medida(registro, _alimentar_leitura)
                                         # estado por recurso (núcleo, volume, interface) e horário da captura, pra dashboard do Marcelo
