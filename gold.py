@@ -654,17 +654,14 @@ def processar_gold():
                                             metrica = leitura.get("metrica")
                                             valor = leitura.get("valor")
                                             status = leitura.get("status")
-                                            acumulador_tempo.adicionar(metrica, instante, valor, status)
-                                            acumulador_evolucao.adicionar(metrica, instante, valor, status)
                                             # cpu_percent_percpu manda uma leitura por nucleo logico na mesma
-                                            # captura, e o AcumuladorPrevisao guarda so por nome da metrica,
-                                            # sem separar por recurso - leituras de nucleos diferentes cairiam
-                                            # juntas na mesma serie e a tendencia sairia misturada entre
-                                            # nucleos. Por enquanto, so alimentamos previsao pra metricas que
-                                            # tem 1 leitura por servidor (disk_percent tambem "tem recurso" - o
-                                            # volume - mas como cada servidor so tem 1 volume no cenario atual,
-                                            # nao ha mistura de verdade ali).
+                                            # captura, e AcumuladorTempoNoEstado/AcumuladorEvolucao/AcumuladorPrevisao
+                                            # guardam so por nome da metrica, sem separar por recurso - leituras de
+                                            # nucleos diferentes cairiam juntas na mesma serie e o estado/tendencia
+                                            # sairia misturado entre nucleos
                                             if metrica != "cpu_percent_percpu":
+                                                acumulador_tempo.adicionar(metrica, instante, valor, status)
+                                                acumulador_evolucao.adicionar(metrica, instante, valor, status)
                                                 acumulador_previsao.adicionar(metrica, instante, valor, status)
 
                                         para_cada_medida(registro, _alimentar_leitura)
@@ -715,16 +712,18 @@ def processar_gold():
                                     leitura["previsao_limite"] = previsao
                             para_cada_medida(resumos, _injetar_previsao)
 
-                # A severidade usa o que acabamos de calcular acima (tempo_por_metrica
-                # ja injetado em "resumos"), mais a contagem de OOM que o resumo ja tinha
-                # antes disso - nao precisa de nenhuma chamada nova a API.
-                severidade = calcular_severidade(resumos)
                 # Estado de cada recurso (núcleo, volume, interface...) com valor atual e desde quando.
                 # Reaproveita a consulta de limites feita acima (cache_limites), sem nova chamada à API.
                 limites_estado = None
                 if tokens is not None:
                     limites_estado = cache_limites.get(tokens)
                 estado_recursos = estados_recursos[(mac, data)].calcular(limites_estado)
+
+                # A severidade usa o que acabamos de calcular acima (tempo_por_metrica
+                # ja injetado em "resumos", mais o estado_recursos que acabou de sair -
+                # # parrte em calcular_severidade), mais a contagem de OOM que o
+                # resumo ja tinha antes disso
+                severidade = calcular_severidade(resumos, estado_recursos)
 
                 diario = {
                     "schema_version": 1, "tipo_documento": "resumo_diario",

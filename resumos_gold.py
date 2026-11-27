@@ -481,7 +481,7 @@ class AcumuladorPrevisao:
 PESOS_SEVERIDADE = {"normal": 0, "atencao": 1, "critico": 2}
 
 
-def calcular_severidade(resumos):
+def calcular_severidade(resumos, estado_recursos=None):
     """Resume num unico campo, pro servidor inteiro, qual e o estado ATUAL mais grave
     entre as metricas - nao e o pior que ja aconteceu durante o dia, e sim o pior
     "agora" (a ultima leitura de cada metrica). corrigindo uma imprecisao que eu
@@ -506,8 +506,17 @@ def calcular_severidade(resumos):
     Por isso, se o dia teve pelo menos um OOM kill (resumos.ram.oom.total_observado > 0),
     forcamos severidade = "critico" por essa regra de negocio (um OOM e grave mesmo que
     a ultima leitura de CPU/RAM esteja normal) - mesmo que a Parte 1 nao tenha achado
-    nada pra comparar. As duas partes sao independentes: uma nao precisa da outra ter
+    nada pra comparar. As tres partes sao independentes: uma nao precisa da outra ter
     dado certo.
+
+    Parte 3 - recursos que a Parte 1 nao enxerga: metricas com leitura por recurso
+    (cpu_percent_percpu, uma por nucleo logico) nao ganham tempo_no_estado - entrariam
+    misturadas na mesma serie, de nucleos diferentes, e o estado sairia errado (ja
+    vimos isso: um nucleo sozinho a 96% virava "normal" porque os outros nucleos,
+    mais calmos, entravam na mesma conta - ver AcumuladorTempoNoEstado). O estado por
+    recurso de verdade mora em estado_recursos (AcumuladorEstadoRecursos), que ja
+    separa cada nucleo/volume/interface - por isso ele tambem concorre aqui pelo pior
+    estado, do mesmo jeito que a Parte 1 faz com as metricas sem recurso.
 
     Por que nunca devolvemos "sem-dados": esse nivel so faz sentido comparando o
     timestamp de uma leitura contra o "agora" de quem le o resumo depois (a regra dos
@@ -529,6 +538,11 @@ def calcular_severidade(resumos):
             pior = estado
 
     para_cada_medida(resumos, _conferir_estado)
+
+    for recurso in estado_recursos or []:
+        estado = recurso.get('estado')
+        if pior is None or PESOS_SEVERIDADE.get(estado, -1) > PESOS_SEVERIDADE.get(pior, -1):
+            pior = estado
 
     oom = resumos.get('ram', {}).get('oom', {}).get('total_observado')
     if isinstance(oom, (int, float)) and not isinstance(oom, bool) and oom > 0:
